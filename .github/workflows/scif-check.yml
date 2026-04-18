@@ -1,0 +1,83 @@
+name: SCIF Typecheck & Compile
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  scif:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout SCIF compiler
+        uses: actions/checkout@v4
+        with:
+          repository: apl-cornell/SCIF
+          path: scif-compiler
+          submodules: true
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build SCIF compiler
+        working-directory: scif-compiler
+        run: ./gradlew build -x test
+
+      - name: Typecheck all .scif files
+        run: |
+          set -e
+          failed=0
+          for f in $(find . -name '*.scif' -not -path './scif-compiler/*' -not -path './tmp/*'); do
+            echo "::group::Typechecking $f"
+            cd scif-compiler
+            if ./scif -t "$GITHUB_WORKSPACE/$f" 2>&1; then
+              echo "OK: $f"
+            else
+              echo "::error file=$f::SCIF typecheck failed"
+              failed=1
+            fi
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
+          if [ $failed -eq 1 ]; then
+            echo "::error::One or more SCIF files failed typechecking"
+            exit 1
+          fi
+
+      - name: Compile all .scif files to Solidity
+        run: |
+          mkdir -p tmp
+          set -e
+          for f in $(find . -name '*.scif' -not -path './scif-compiler/*' -not -path './tmp/*'); do
+            echo "::group::Compiling $f"
+            outfile="tmp/$(basename "$f" .scif).sol"
+            cd scif-compiler
+            if ./scif -c "$GITHUB_WORKSPACE/$f" -o "$GITHUB_WORKSPACE/$outfile" 2>&1; then
+              echo "OK: $f -> $outfile"
+            else
+              echo "::error file=$f::SCIF compilation failed"
+              exit 1
+            fi
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
+
+      - name: Upload compiled Solidity
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compiled-solidity
+          path: tmp/*.sol
+          retention-days: 7
