@@ -14,11 +14,17 @@ jobs:
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Checkout SCIF compiler
         uses: actions/checkout@v4
         with:
           repository: apl-cornell/SCIF
+          # Pin to the `latest` release tag (commit 8f16d94). The SCIF main
+          # branch has breaking changes that prevent it from building; this
+          # tag matches the prebuilt JAR release and compiles cleanly.
+          ref: latest
           path: scif-compiler
           submodules: true
 

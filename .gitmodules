@@ -1,0 +1,8 @@
+[submodule "third_party/pa-evm"]
+	path = third_party/pa-evm
+	url = https://github.com/anoma/pa-evm.git
+	branch = main
+[submodule "third_party/anomapay-erc20-forwarder"]
+	path = third_party/anomapay-erc20-forwarder
+	url = https://github.com/anoma/anomapay-erc20-forwarder.git
+	branch = main
