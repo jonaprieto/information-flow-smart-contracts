@@ -1,0 +1,22 @@
+# SCIF compiler output
+tmp/
+*.sol.gen
+
+# LaTeX build artifacts
+doc/*.aux
+doc/*.log
+doc/*.out
+doc/*.toc
+doc/*.fls
+doc/*.fdb_latexmk
+doc/*.synctex.gz
+doc/*.pdf
+texput.log
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
