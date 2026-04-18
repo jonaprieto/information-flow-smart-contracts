@@ -1,0 +1,142 @@
+// PaAndForwarder — Combined model for cross-contract CDA analysis.
+//
+// Both ProtocolAdapter and ForwarderBase in one file so SCIF can trace
+// the full call chain: PA.execute() -> ForwarderBase.forwardCall()
+//
+// CROSS-CONTRACT CDA TRACE:
+//   1. User calls PA.execute(...) — all params are {sender}
+//   2. PA endorses all params to {this} (ZK proof justifies)
+//   3. PA calls IForwarder(forwarder).forwardCall(logicRef, input)
+//   4. ForwarderBase receives call with msg.sender == PA address
+//   5. ForwarderBase checks msg.sender == _PROTOCOL_ADAPTER
+//   6. ForwarderBase endorses the input from {sender=PA} to {this}
+//
+// Label flow:
+//   {user/sender} -> endorse -> {PA/this} -> call -> {Fwd/sender} -> endorse -> {Fwd/this}
+//
+// Each endorse is explicit in SCIF. In Solidity, both are implicit.
+
+interface IForwarder {
+    @public bytes forwardCall(uint logicRef, bytes input);
+}
+
+// ============================================================
+// ForwarderBase — target of PA's forwarder calls
+// ============================================================
+
+contract ForwarderBase implements IForwarder {
+
+    address{this} _PROTOCOL_ADAPTER;
+    uint{this} _LOGIC_REF;
+
+    constructor(address protocolAdapter, uint logicRef) {
+        _PROTOCOL_ADAPTER = endorse(protocolAdapter, sender -> this);
+        _LOGIC_REF = endorse(logicRef, sender -> this);
+        super();
+    }
+
+    @public
+    bytes forwardCall(uint logicRef, bytes input) {
+
+        // Access control: only PA can call
+        // SCIF insight: sender has label {sender} (anyone).
+        // We compare against {this}-labeled _PROTOCOL_ADAPTER.
+        // The assert bridges the trust gap.
+        if (sender != _PROTOCOL_ADAPTER) {
+            assert false;
+        }
+
+        // After verifying sender IS PA, endorse inputs
+        uint{this} eLogicRef = endorse(logicRef, sender -> this);
+        bytes{this} eInput = endorse(input, sender -> this);
+
+        if (_LOGIC_REF != eLogicRef) {
+            assert false;
+        }
+
+        // Dispatch to wrap/unwrap (simplified)
+        result = eInput;
+    }
+}
+
+// ============================================================
+// ProtocolAdapterCore — calls ForwarderBase
+// ============================================================
+
+contract ProtocolAdapterCore {
+
+    map(uint, bool) _nullifiers;
+    uint{this} _commitmentCount;
+    bool{this} _paused;
+
+    exception Paused();
+    exception NullifierAlreadyExists();
+    exception ForwarderCallOutputMismatch();
+
+    constructor() {
+        _paused = false;
+        _commitmentCount = 0;
+        super();
+    }
+
+    @public
+    void execute(
+        uint nullifier,
+        uint commitment,
+        uint logicRef,
+        address forwarderAddr,
+        bytes forwarderInput,
+        bytes expectedOutput
+    ) throws (Paused, NullifierAlreadyExists, ForwarderCallOutputMismatch) {
+
+        if (_paused) {
+            throw Paused();
+        }
+
+        // FINDING 1: All these endorsements are IMPLICIT in the original
+        // Solidity. SCIF forces them to be explicit.
+        // Justification: ZK proof verified (modeled as oracle assumption).
+        uint{this} eNull = endorse(nullifier, sender -> this);
+        uint{this} eComm = endorse(commitment, sender -> this);
+        uint{this} eLogicRef = endorse(logicRef, sender -> this);
+        address{this} eForwarder = endorse(forwarderAddr, sender -> this);
+        bytes{this} eInput = endorse(forwarderInput, sender -> this);
+        bytes{this} eExpected = endorse(expectedOutput, sender -> this);
+
+        lock(this) {
+            // State: add nullifier
+            if (_nullifiers[eNull]) {
+                throw NullifierAlreadyExists();
+            }
+            _nullifiers[eNull] = true;
+            _commitmentCount = _commitmentCount + 1;
+
+            // FINDING 2 (CDA): PA calls arbitrary forwarder address
+            // with PA's identity as msg.sender.
+            //
+            // The forwarder trusts PA because msg.sender == _PROTOCOL_ADAPTER.
+            // But the forwarder address itself came from user calldata
+            // (endorsed via ZK proof).
+            //
+            // If the ZK circuit has a bug allowing arbitrary addresses,
+            // the user controls which contract receives a PA-authorized call.
+            //
+            // This is the EXACT Dexible CDA pattern:
+            //   User (sender) -> PA (deputy) -> Forwarder (target)
+            //
+            // SCIF makes the endorsement chain visible:
+            //   forwarderAddr: {sender} -> endorse -> {this}
+            //   Call site: IForwarder({this} addr).forwardCall(...)
+            atomic {
+                IForwarder fwd = IForwarder(eForwarder);
+                bytes output = fwd.forwardCall(eLogicRef, eInput);
+
+                if (output != eExpected) {
+                    throw ForwarderCallOutputMismatch();
+                }
+            } rescue * {
+                throw ForwarderCallOutputMismatch();
+            }
+        }
+    }
+}

@@ -1,0 +1,169 @@
+// ProtocolAdapterCore — SCIF model of the Anoma ProtocolAdapter.
+//
+// Original: pa/contracts/src/ProtocolAdapter.sol
+//
+// Models the trust-critical core: execute() -> _executeForwarderCall()
+// Simplified: no nested structs, no ZK proof types, no MerkleTree.
+//
+// SCIF analysis targets:
+//   1. Implicit endorsement of forwarder address from calldata (CDA)
+//   2. State writes after external calls (reentrancy/PC degradation)
+//   3. Forwarder output mismatch handling (exception safety)
+//
+// KEY FINDINGS:
+//   - All user-supplied data ({sender}) must be explicitly endorsed
+//     after ZK proof verification. SCIF makes this trust boundary visible.
+//   - The lock(this) around the forwarder call + state writes ensures
+//     reentrancy safety, matching the original nonReentrant modifier.
+
+import "../interfaces/IForwarder.scif";
+
+contract ProtocolAdapterCore {
+
+    // --- State ---
+
+    address{this} _riscZeroVerifier;
+    map(uint, bool) _nullifiers;
+    uint{this} _commitmentCount;
+    bool{this} _paused;
+    address{this} _owner;
+
+    // --- Exceptions ---
+
+    exception Paused();
+    exception NullifierAlreadyExists();
+    exception ForwarderCallOutputMismatch();
+    exception VerificationFailed();
+
+    // --- Constructor ---
+
+    constructor(address riscZeroVerifier, address owner) {
+        _riscZeroVerifier = endorse(riscZeroVerifier, sender -> this);
+        _owner = endorse(owner, sender -> this);
+        _paused = false;
+        _commitmentCount = 0;
+        super();
+    }
+
+    // --- execute: main entry point ---
+    //
+    // @public => {sender -> this; this}
+    //   Anyone can submit transactions. Auto-endorses to {this}.
+    //   Lock label {this} provides reentrancy protection.
+    //
+    // FINDING 1 (ENDORSEMENT): All parameters are {sender} (user input).
+    // After ZK proof verification, we MUST explicitly endorse them to {this}.
+    // In the original Solidity, this endorsement is IMPLICIT — calldata
+    // fields are used directly after _processRiscZeroProof succeeds.
+    // SCIF forces the developer to annotate where trust is granted.
+
+    @public
+    void execute(
+        uint nullifier,
+        uint commitment,
+        uint logicRef,
+        address forwarderAddr,
+        bytes forwarderInput,
+        bytes expectedOutput,
+        bytes proof
+    ) throws (Paused, NullifierAlreadyExists,
+              ForwarderCallOutputMismatch, VerificationFailed) {
+
+        if (_paused) {
+            throw Paused();
+        }
+
+        // --- ZK Proof Verification ---
+        // The proof is user-supplied ({sender}) but gets passed to the
+        // trusted verifier. We endorse it first because the trusted
+        // verifier (immutable address) will validate it.
+        // FINDING: SCIF correctly flags that passing {sender} data to a
+        // {this}-integrity method requires explicit endorsement.
+        bytes{this} endorsedProof = endorse(proof, sender -> this);
+        _verifyProof(endorsedProof);
+
+        // --- Endorse user data after proof verification ---
+        // FINDING 1 (EXPLICIT TRUST): These endorsements document the
+        // trust assumption: the ZK proof binds all these values.
+        // If the circuit has a gap, the endorsement is unsound.
+        uint{this} eNullifier = endorse(nullifier, sender -> this);
+        uint{this} eCommitment = endorse(commitment, sender -> this);
+        uint{this} eLogicRef = endorse(logicRef, sender -> this);
+        address{this} eForwarder = endorse(forwarderAddr, sender -> this);
+        bytes{this} eInput = endorse(forwarderInput, sender -> this);
+        bytes{this} eExpected = endorse(expectedOutput, sender -> this);
+
+        // --- State transitions + external call ---
+        // All protected by lock(this) matching the nonReentrant modifier
+        lock(this) {
+            // Add nullifier (must not already exist)
+            if (_nullifiers[eNullifier]) {
+                throw NullifierAlreadyExists();
+            }
+            _nullifiers[eNullifier] = true;
+
+            // Add commitment
+            _commitmentCount = _commitmentCount + 1;
+
+            // FINDING 2 (CDA / ARBITRARY CODE EXECUTION):
+            // eForwarder is an address decoded from user calldata,
+            // endorsed via ZK proof. The PA calls an arbitrary contract
+            // at this address with PA's own msg.sender identity.
+            //
+            // The forwarder at eForwarder receives a call FROM the PA.
+            // It checks msg.sender == _PROTOCOL_ADAPTER (this contract).
+            // So the PA acts as a TRUSTED DEPUTY for the user.
+            //
+            // CDA risk: if the ZK circuit allows the user to specify
+            // a malicious forwarder address, the PA would call it with
+            // full PA authority. The forwarder's _checkCaller would pass
+            // because msg.sender IS the PA.
+            //
+            // Mitigation: the ZK circuit must constrain the forwarder
+            // address to only valid, registered forwarders.
+            // SCIF makes this trust boundary EXPLICIT via the endorsement.
+            _executeForwarderCall(eLogicRef, eForwarder, eInput, eExpected);
+        }
+    }
+
+    // --- _executeForwarderCall ---
+    //
+    // Calls IForwarder(forwarder).forwardCall(logicRef, input)
+    // and verifies output matches expectedOutput.
+
+    void _executeForwarderCall(
+        uint{this} logicRef,
+        address{this} forwarder,
+        bytes{this} input,
+        bytes{this} expectedOutput
+    ) throws (ForwarderCallOutputMismatch) {
+        // External call to untrusted contract
+        IForwarder fwd = IForwarder(forwarder);
+        bytes actualOutput = fwd.forwardCall(logicRef, input);
+
+        // Verify output — data integrity check
+        if (actualOutput != expectedOutput) {
+            throw ForwarderCallOutputMismatch();
+        }
+    }
+
+    // --- _verifyProof (oracle) ---
+    // Models RISC Zero proof verification. Reverts if invalid.
+    // The proof data has been endorsed to {this} by the caller.
+
+    void _verifyProof(bytes{this} proof)
+        throws (VerificationFailed) {
+        // Oracle: always succeeds in the model.
+        // Real contract: _TRUSTED_RISC_ZERO_VERIFIER_ROUTER.verify(...)
+    }
+
+    // --- emergencyStop ---
+
+    @public
+    void emergencyStop() {
+        if (sender != _owner) {
+            assert false;
+        }
+        _paused = true;
+    }
+}

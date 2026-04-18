@@ -1,0 +1,90 @@
+// ForwarderBase — SCIF model of the Anoma ForwarderBase contract.
+//
+// Original: anomapay-erc20-forwarder/contracts/src/bases/ForwarderBase.sol
+//
+// SCIF limitation: `final` fields must be initialized at declaration,
+// not in constructors. Since _PROTOCOL_ADAPTER is set at deploy time,
+// we use `address{this}` and enforce access control via runtime check +
+// endorse pattern. This mirrors the original Solidity _checkCaller().
+//
+// What SCIF enforces:
+//   1. Input data is {sender} until explicitly endorsed after access check
+//   2. The lock label prevents re-entrant calls
+//   3. Output has integrity {this}
+//   4. _PROTOCOL_ADAPTER and _LOGIC_REF have {this} integrity (only
+//      this contract can modify them — set once in constructor)
+
+contract ForwarderBase {
+
+    // Protocol adapter address — {this} integrity means only the contract
+    // itself can set it (in the constructor). Not `final` due to SCIF
+    // limitation, but conceptually immutable.
+    address{this} _PROTOCOL_ADAPTER;
+
+    // Expected logic reference (bytes32 in Solidity → uint here)
+    uint{this} _LOGIC_REF;
+
+    // --- Exceptions ---
+
+    exception UnauthorizedCaller();
+    exception UnauthorizedLogicRef();
+
+    // --- Constructor ---
+
+    constructor(address protocolAdapter, uint logicRef) {
+        _PROTOCOL_ADAPTER = endorse(protocolAdapter, sender -> this);
+        _LOGIC_REF = endorse(logicRef, sender -> this);
+        super();
+    }
+
+    // --- Core: forwardCall ---
+    //
+    // @public means {sender -> this; this}:
+    //   l_ex = sender   — anyone can attempt a call
+    //   l_in = this      — auto-endorses control flow to contract integrity
+    //   l_lk = this      — holds reentrancy lock
+    //
+    // Access control: runtime check sender == _PROTOCOL_ADAPTER
+    // This is exactly what the original Solidity does with _checkCaller().
+    //
+    // IFC insight: the `input` parameter has label {sender} (untrusted).
+    // After we verify sender IS the PA, we endorse it to {this}.
+    // Without the endorse, SCIF would reject passing input to _forwardCall
+    // which expects {this}-integrity data.
+
+    @public
+    bytes{this} forwardCall(uint logicRef, bytes input)
+        throws (UnauthorizedCaller, UnauthorizedLogicRef) {
+
+        // Access control check — mirrors _checkCaller(_PROTOCOL_ADAPTER)
+        if (sender != _PROTOCOL_ADAPTER) {
+            throw UnauthorizedCaller();
+        }
+
+        // After verifying sender is PA, endorse input data from
+        // {sender} to {this}. The condition (sender == PA) justifies
+        // the endorsement: PA is trusted to provide valid input.
+        uint{this} endorsedLogicRef = endorse(logicRef, sender -> this);
+        bytes{this} endorsedInput = endorse(input, sender -> this);
+
+        // Logic reference check — data-level, not IFC
+        if (_LOGIC_REF != endorsedLogicRef) {
+            throw UnauthorizedLogicRef();
+        }
+
+        // Delegate to internal implementation
+        result = _forwardCall(endorsedInput);
+    }
+
+    // Internal dispatch — subcontracts override
+    bytes{this} _forwardCall(bytes{this} input) {
+        result = input;
+    }
+
+    // --- View functions ---
+
+    @public
+    address{this} getProtocolAdapter() {
+        result = _PROTOCOL_ADAPTER;
+    }
+}

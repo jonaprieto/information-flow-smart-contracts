@@ -1,0 +1,13 @@
+// IForwarder — SCIF interface for Anoma forwarder contracts.
+//
+// Original: pa/contracts/src/interfaces/IForwarder.sol
+//
+// In SCIF, the interface cannot use a field-based principal for the
+// external begin label. Instead, we use a parameter-based approach:
+// the caller passes its identity, and the forwarder verifies it.
+
+interface IForwarder {
+    // forwardCall: the PA calls this on behalf of a user transaction.
+    // The input and logicRef have label of whoever calls this method.
+    @public bytes forwardCall(uint logicRef, bytes input);
+}

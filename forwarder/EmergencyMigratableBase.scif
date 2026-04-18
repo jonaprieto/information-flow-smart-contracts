@@ -1,0 +1,243 @@
+// EmergencyMigratableBase — SCIF model of EmergencyMigratableForwarderBase.
+//
+// Original: anomapay-erc20-forwarder/contracts/src/bases/EmergencyMigratableForwarderBase.sol
+//
+// KEY IFC QUESTIONS THIS MODEL ANSWERS:
+//
+//   Q1: Can the emergency committee drain funds?
+//       Yes — label chain: _EMERGENCY_COMMITTEE sets _emergencyCaller (write-
+//       once), then emergencyCaller calls forwardEmergencyCall. If the
+//       committee is compromised OR if they appoint a malicious caller,
+//       all tokens held by this contract are at risk.
+//
+//   Q2: Is the write-once invariant of _emergencyCaller enforced?
+//       Partially. SCIF labels _emergencyCaller as {_EMERGENCY_COMMITTEE}
+//       (only the committee can write it). But SCIF cannot enforce the
+//       write-once property at the type level — this is a runtime check
+//       (if _emergencyCaller != address(0) revert). The model documents
+//       this as an explicit endorsement that the committee is trusted
+//       not to call setEmergencyCaller twice (i.e., the runtime check
+//       is the only guard).
+//
+//   Q3: Is the emergency committee itself a point of centralization?
+//       Yes — _EMERGENCY_COMMITTEE has {this} integrity (set at deploy
+//       time by the deployer), but the committee address itself is a
+//       single trusted party. SCIF surfaces this: setEmergencyCaller
+//       requires endorsing the caller from {sender} to {this} only
+//       AFTER the committee address check. This is labeled clearly.
+//
+// LABEL GLOSSARY:
+//   {this}   — contract-level integrity (only the contract can establish)
+//   {sender} — caller-supplied data (untrusted until checked/endorsed)
+//   {any}    — unrestricted / public
+//
+// SCIF LIMITATIONS WORKED AROUND:
+//   - `final` (immutable) fields cannot be set in constructors in SCIF.
+//     _EMERGENCY_COMMITTEE is {this}-labeled and set in the constructor
+//     via endorse(committeeAddr, sender -> this). This is conceptually
+//     immutable but SCIF doesn't enforce it structurally.
+//   - `bytes32` is not a SCIF type; modeled as `uint`.
+
+// Interface for the stopped Protocol Adapter's emergency-stopped check.
+interface IProtocolAdapterEmergencyCheck {
+    @public bool isEmergencyStopped();
+}
+
+// ============================================================
+// EmergencyMigratableBase
+// ============================================================
+//
+// Extends ForwarderBase with emergency migration capability:
+//   1. Emergency committee (governance multisig) can appoint an
+//      emergency caller once PA is stopped.
+//   2. Emergency caller can then invoke forwardEmergencyCall to
+//      drain/migrate funds out of this contract.
+//
+// TRUST CHAIN (label flow):
+//   Deployer sets _EMERGENCY_COMMITTEE with {this} integrity
+//     ↓
+//   Committee calls setEmergencyCaller → _emergencyCaller gets {this} integrity
+//   (write-once: runtime check, not label system)
+//     ↓
+//   emergencyCaller calls forwardEmergencyCall
+//   → all funds can be moved (FINDING: this is the drain vector)
+
+contract EmergencyMigratableBase {
+
+    // Protocol adapter address — set once in constructor.
+    // {this} integrity: only the deployer (during construction) sets this.
+    address{this} _PROTOCOL_ADAPTER;
+
+    // Emergency committee — the governance multisig.
+    // {this} integrity: set at deploy time, conceptually immutable.
+    //
+    // FINDING 6: This is the root of trust for emergency migration.
+    // If the committee is compromised, an attacker can appoint themselves
+    // as emergency caller and drain all tokens. SCIF makes this explicit
+    // because _emergencyCaller's integrity flows from _EMERGENCY_COMMITTEE.
+    address{this} _EMERGENCY_COMMITTEE;
+
+    // Emergency caller — set once by the committee after PA stops.
+    // {this} integrity after assignment: the committee's decision is
+    // endorsed to contract integrity.
+    // FINDING 7: The write-once invariant is NOT enforced by labels —
+    // it relies solely on the runtime check `if (_emergencyCaller != address(0))`.
+    // SCIF cannot express "write-once" as a label property.
+    address{this} _emergencyCaller;
+
+    // --- Exceptions ---
+
+    exception UnauthorizedCaller();
+    exception EmergencyCallerNotSet();
+    exception EmergencyCallerAlreadySet();
+    exception ProtocolAdapterNotStopped();
+    exception ZeroAddressNotAllowed();
+
+    // --- Constructor ---
+
+    constructor(address protocolAdapter, address emergencyCommittee) {
+        // Both constructor args come from the deployer (sender).
+        // We endorse them to {this} — the deployer is trusted to set
+        // correct initial configuration.
+        _PROTOCOL_ADAPTER = endorse(protocolAdapter, sender -> this);
+        _EMERGENCY_COMMITTEE = endorse(emergencyCommittee, sender -> this);
+        // _emergencyCaller starts as the zero address (unset).
+        // In SCIF we represent "not set" as address(0). We endorse the
+        // zero literal so it has {this} integrity from the start.
+        _emergencyCaller = endorse(address(0), sender -> this);
+        super();
+    }
+
+    // --- setEmergencyCaller ---
+    //
+    // @public: anyone can attempt, but access control gates on sender == committee.
+    //
+    // Label analysis:
+    //   1. sender has label {sender} (untrusted)
+    //   2. _EMERGENCY_COMMITTEE has label {this} (trusted)
+    //   3. Runtime check: if sender != _EMERGENCY_COMMITTEE → revert
+    //   4. After the check, newEmergencyCaller input is endorsed {sender} → {this}
+    //      Justification: the committee is trusted to supply a valid address.
+    //   5. Write-once: runtime check `_emergencyCaller != address(0)` is the
+    //      only guard — SCIF labels alone cannot prevent double-write.
+    //
+    // FINDING 8: The committee has UNCONDITIONAL POWER once PA is stopped.
+    // There is no time-lock, no multi-step approval, no second endorser.
+    // Compromising the committee key allows immediate appointment of a
+    // draining address. SCIF makes this single-actor risk explicit.
+
+    @public
+    void setEmergencyCaller(address newEmergencyCaller)
+        throws (UnauthorizedCaller, ZeroAddressNotAllowed, EmergencyCallerAlreadySet, ProtocolAdapterNotStopped) {
+
+        // Access control: only the committee can call this.
+        // SCIF: sender ({sender}) vs _EMERGENCY_COMMITTEE ({this}) — bridged by assert.
+        if (sender != _EMERGENCY_COMMITTEE) {
+            throw UnauthorizedCaller();
+        }
+
+        // Zero address guard.
+        if (newEmergencyCaller == address(0)) {
+            throw ZeroAddressNotAllowed();
+        }
+
+        // Write-once guard — RUNTIME ONLY (not a label property).
+        // SCIF FINDING: this is the sole protection against the committee
+        // calling this function twice to replace the emergency caller.
+        if (_emergencyCaller != address(0)) {
+            throw EmergencyCallerAlreadySet();
+        }
+
+        // PA must be stopped before we allow an emergency caller to be set.
+        // This prevents the committee from appointing an emergency caller
+        // while the system is still running normally.
+        IProtocolAdapterEmergencyCheck pa = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER);
+        bool stopped = pa.isEmergencyStopped();
+        if (!stopped) {
+            throw ProtocolAdapterNotStopped();
+        }
+
+        // After all checks pass, endorse the committee-supplied address
+        // from {sender} to {this}.
+        // This is the key trust escalation: committee trust → contract trust.
+        address{this} endorsedCaller = endorse(newEmergencyCaller, sender -> this);
+        _emergencyCaller = endorsedCaller;
+    }
+
+    // --- forwardEmergencyCall ---
+    //
+    // @public: anyone can attempt, but access control gates on sender == _emergencyCaller.
+    //
+    // Label analysis:
+    //   1. _emergencyCaller has label {this} (set by committee, endorsed above)
+    //   2. Runtime check: sender == _emergencyCaller
+    //   3. After check, input is endorsed {sender} → {this}
+    //      Justification: the emergency caller was appointed by the committee.
+    //   4. lock(this): reentrancy guard — mirrors nonReentrant modifier.
+    //
+    // FINDING 9 (CDA RISK): forwardEmergencyCall lets the emergency caller
+    // run arbitrary logic via _forwardEmergencyCall. The caller address was
+    // set by the committee with {this} integrity — but the CALL itself is to
+    // an external target with user-supplied input. The {sender} label on
+    // `input` requires explicit endorsement, which SCIF forces to be visible.
+    //
+    // FINDING 10: The PC label inside lock(this) remains {this} until the
+    // external call to _forwardEmergencyCall. After that call the PC degrades.
+    // SCIF's lock prevents re-entrant calls from exploiting this.
+
+    @public
+    bytes forwardEmergencyCall(bytes input)
+        throws (EmergencyCallerNotSet, UnauthorizedCaller, ProtocolAdapterNotStopped) {
+
+        // Emergency caller must be set first.
+        if (_emergencyCaller == address(0)) {
+            throw EmergencyCallerNotSet();
+        }
+
+        // Access control: only the appointed emergency caller.
+        if (sender != _emergencyCaller) {
+            throw UnauthorizedCaller();
+        }
+
+        // PA must still be stopped.
+        IProtocolAdapterEmergencyCheck pa = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER);
+        bool stopped = pa.isEmergencyStopped();
+        if (!stopped) {
+            throw ProtocolAdapterNotStopped();
+        }
+
+        // Endorse input from {sender} to {this}.
+        // Justification: the emergency caller was committee-appointed;
+        // we trust their input as much as the committee trusted them.
+        bytes{this} endorsedInput = endorse(input, sender -> this);
+
+        // lock(this): reentrancy guard.
+        // SCIF ensures that within this block, the PC label stays {this}
+        // and that recursive re-entry via _forwardEmergencyCall is blocked.
+        lock(this) {
+            atomic {
+                result = _forwardEmergencyCallInternal(endorsedInput);
+            } rescue * {
+                result = endorsedInput;
+            }
+        }
+    }
+
+    // Internal dispatch — subcontracts override to implement token transfer.
+    // Input has {this} integrity (endorsed by the time it arrives here).
+    bytes{this} _forwardEmergencyCallInternal(bytes{this} input) {
+        result = input;
+    }
+
+    // --- View: getEmergencyCaller ---
+
+    @public
+    address getEmergencyCaller() {
+        result = _emergencyCaller;
+    }
+
+    @public
+    address getProtocolAdapter() {
+        result = _PROTOCOL_ADAPTER;
+    }
+}

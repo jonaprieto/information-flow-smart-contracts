@@ -1,0 +1,19 @@
+// IERC20 — SCIF interface for ERC20 tokens.
+//
+// Copied from /Users/jonaprieto/anoma/forks/SCIF/test/contracts/tutorialExamples/IERC20.scif
+// and adapted for the ERC20Forwarder model.
+//
+// Key label annotations:
+//   balanceOf  — anyone can call, result has no special integrity
+//   transfer   — requires from-principal label; caller must hold {from} authority
+//   transferFrom — bridging sender -> from label escalation
+
+interface IERC20 {
+    exception ERC20InsufficientBalance(address owner, uint cur, uint needed);
+    exception ERC20InsufficientAllowance(address owner, uint cur, uint needed);
+    @public uint balanceOf(address account);
+    @public void approve{sender}(address allowed, uint amount);
+    @public void approveFrom{from}(final address from, address spender, uint val);
+    @public void transfer{from -> this}(final address from, address to, uint amount) throws (ERC20InsufficientBalance{this});
+    @public void transferFrom{sender -> from; sender}(final address from, address to, uint amount) throws (ERC20InsufficientAllowance{this}, ERC20InsufficientBalance{this});
+}

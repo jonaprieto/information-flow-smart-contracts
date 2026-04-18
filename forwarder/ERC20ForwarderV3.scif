@@ -1,0 +1,550 @@
+// ERC20ForwarderV3 — SCIF model of the V1→V2→V3 emergency migration chain.
+//
+// Original contracts:
+//   - EmergencyMigratableForwarderBase.sol
+//   - ERC20ForwarderV2.sol
+//   - ERC20ForwarderV3.sol (contains the V3 constructor bug)
+//
+// BUG MODELED HERE (ERC20ForwarderV3.sol line 77):
+//   _COMMITMENT_TREE_ROOT_V2 = ICommitmentTree(_PROTOCOL_ADAPTER_V1)
+//                                              ^^^^^^^^^^^^^^^^
+//   Should be: ICommitmentTree(_PROTOCOL_ADAPTER_V2)
+//
+//   This means V3 captures V1's final commitment root instead of V2's.
+//   Any V2 resource committed AFTER V1's last root will fail the root check
+//   in _migrateV2 and be PERMANENTLY UNMIGRABLE.
+//
+// MODEL FIXES APPLIED (from independent evaluation):
+//   - MED-3 FIX: Added _PROTOCOL_ADAPTER_V3 field, stored paV3Addr in constructor,
+//     and updated setEmergencyCaller + forwardEmergencyCall to check V3's own PA
+//     instead of V2's PA for the emergency stop condition.
+//   - GAP-3 NOTE: forwardEmergencyCall still returns endorsedInput directly
+//     (does not dispatch to migration logic). A complete model would decode
+//     callType and route to _migrateV1/_migrateV2/Wrap/Unwrap.
+//
+// HOW SCIF MAKES THE BUG VISIBLE:
+//   The commitment tree root fields are named with their intended source:
+//     _COMMITMENT_TREE_ROOT_FROM_PA_V2  — what V3 SHOULD store
+//   But in the buggy constructor, the value comes from _PROTOCOL_ADAPTER_V1,
+//   giving it label {_PROTOCOL_ADAPTER_V1} semantically.
+//
+//   SCIF forces the developer to write:
+//     _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootReadFromPaV1, sender -> this)
+//   The comment "rootReadFromPaV1" makes the wrong source explicit in the code.
+//   A reviewer scanning endorsements will immediately see the mismatch between
+//   the variable name (FROM_PA_V2) and the endorsed value (rootReadFromPaV1).
+//
+// IFC QUESTIONS ANSWERED:
+//   Q1: Can the emergency committee drain funds?
+//       YES — see FINDING 8 in EmergencyMigratableBase.scif. The committee
+//       sets _emergencyCaller with {this} integrity; _emergencyCaller can then
+//       call forwardEmergencyCall with arbitrary input, draining all tokens.
+//
+//   Q2: Is the write-once invariant of _emergencyCaller enforced?
+//       PARTIALLY — runtime check only (see FINDING 7). Not a label property.
+//
+//   Q3: Does the V3 constructor bug surface through label naming?
+//       YES — the endorsement comment forces the developer to state the source.
+//       FINDING 11 below documents this.
+//
+//   Q4: Is the nullifier double-spend check in V2 _migrateV1 safe during
+//       the external call to V1?
+//       YES — the nullifier is added to V2's own set BEFORE the external call
+//       to V1's forwardEmergencyCall. SCIF's lock(this) prevents re-entrancy.
+//       FINDING 12 below documents this.
+//
+// LABEL GLOSSARY:
+//   {this}   — contract integrity (trusted)
+//   {sender} — caller-supplied (untrusted until endorsed)
+//   {any}    — public / unrestricted
+
+// ============================================================
+// Interfaces for cross-contract calls
+// ============================================================
+
+// Used to check if a protocol adapter is emergency stopped.
+interface IProtocolAdapterEmergencyCheck {
+    @public bool isEmergencyStopped();
+}
+
+// Used to read the latest commitment tree root from a protocol adapter.
+interface ICommitmentTreeReader {
+    @public uint latestCommitmentTreeRoot();
+}
+
+// Interface for calling forwardEmergencyCall on a previous forwarder.
+interface IEmergencyForwarder {
+    @public bytes forwardEmergencyCall(bytes input);
+}
+
+// Interface for checking if a nullifier is already in a nullifier set.
+interface INullifierChecker {
+    @public bool isNullifierContained(uint nullifier);
+}
+
+// ============================================================
+// ERC20ForwarderV2Core — Models V2 migration logic
+// ============================================================
+//
+// V2 introduces migration of V1 resources:
+//   1. Read V1's final commitment tree root at construction time.
+//   2. _migrateV1: verify nullifier not in V1's set, add to V2's set,
+//      then call V1's forwardEmergencyCall to pull tokens.
+//
+// FINDING 12 (Nullifier Race Safety):
+//   The nullifier is inserted into V2's own nullifier set BEFORE the
+//   external call to V1's forwardEmergencyCall. This is the correct order:
+//   checks → effects → interactions (CEI pattern). SCIF's lock(this) confirms
+//   that no re-entrant call can bypass the nullifier check and insert the
+//   same nullifier twice.
+//
+//   If the order were reversed (insert after external call), a re-entrant
+//   call through V1 could re-enter _migrateV1 and drain tokens twice.
+//   The lock + CEI ordering prevents this.
+
+contract ERC20ForwarderV2Core {
+
+    // Protocol adapter V1 — the stopped predecessor.
+    address{this} _PROTOCOL_ADAPTER_V1;
+
+    // V1 forwarder — tokens are pulled from this contract during migration.
+    address{this} _ERC20_FORWARDER_V1;
+
+    // V1's final commitment tree root — captured at V2 construction time.
+    // {this} integrity: read from a trusted PA address, endorsed by deployer.
+    uint{this} _COMMITMENT_TREE_ROOT_V1;
+
+    // V1's logic reference — used to validate migrating resources.
+    uint{this} _LOGIC_REFERENCE_V1;
+
+    // V2's own nullifier set — tracks which V1 nullifiers have been consumed.
+    // key: nullifier (uint), value: already-consumed flag (bool)
+    map(uint, bool) _nullifiersV2;
+
+    // Emergency committee and caller (inherited from EmergencyMigratableBase).
+    address{this} _EMERGENCY_COMMITTEE;
+    address{this} _emergencyCaller;
+
+    // --- Exceptions ---
+
+    exception UnauthorizedCaller();
+    exception ProtocolAdapterV1NotStopped();
+    exception ResourceAlreadyConsumed();
+    exception InvalidCommitmentRootV1();
+    exception InvalidLogicRefV1();
+    exception InvalidForwarderV1();
+    exception NullifierAlreadyExists();
+
+    // --- Constructor ---
+    //
+    // Label analysis of V2 constructor:
+    //   - paV1Addr, fwdV1Addr come from deployer (sender) → endorsed to {this}
+    //   - We read paV1.latestCommitmentTreeRoot() from the stopped V1 PA.
+    //     The returned uint has label {sender} relative to THIS constructor
+    //     (the external call result is untrusted). We endorse it to {this}
+    //     with the comment "from PA_V1 after stop" — the deployer's trust
+    //     in the V1 PA justifies this endorsement.
+    //
+    // ENDORSEMENT NOTE: The PA check (isEmergencyStopped) ensures we only
+    // capture the root AFTER V1 is frozen. This is a crucial pre-condition
+    // for migration safety.
+
+    constructor(
+        address paV2Addr,
+        address committeeAddr,
+        address paV1Addr,
+        address fwdV1Addr
+    ) {
+        _EMERGENCY_COMMITTEE = endorse(committeeAddr, sender -> this);
+        _PROTOCOL_ADAPTER_V1 = endorse(paV1Addr, sender -> this);
+        _ERC20_FORWARDER_V1 = endorse(fwdV1Addr, sender -> this);
+        _emergencyCaller = endorse(address(0), sender -> this);
+        // Initialize with placeholder; will be updated after super().
+        // SCIF limitation: method calls require super() to be called first.
+        _COMMITMENT_TREE_ROOT_V1 = endorse(0, sender -> this);
+        _LOGIC_REFERENCE_V1 = endorse(0, sender -> this);
+        super();
+
+        // Read and capture V1's final commitment root.
+        // Pre-condition: V1 PA must be stopped.
+        // (SCIF requires super() before any method calls in a constructor.)
+        IProtocolAdapterEmergencyCheck paV1Check = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V1);
+        bool v1Stopped = paV1Check.isEmergencyStopped();
+        if (!v1Stopped) {
+            assert false;
+        }
+
+        ICommitmentTreeReader paV1Tree = ICommitmentTreeReader(_PROTOCOL_ADAPTER_V1);
+        uint rootFromPaV1 = paV1Tree.latestCommitmentTreeRoot();
+        // Endorse: we trust _PROTOCOL_ADAPTER_V1 (deployer-supplied) to return
+        // the authentic final root for V1 resources.
+        _COMMITMENT_TREE_ROOT_V1 = endorse(rootFromPaV1, sender -> this);
+    }
+
+    // --- _migrateV1 ---
+    //
+    // Called internally (e.g., from _forwardCall) to migrate a V1 resource.
+    // Parameters carry {this} integrity (endorsed upstream by caller check).
+    //
+    // FINDING 12: CEI pattern confirmed via label analysis.
+    //   Step 1 (Check):  isNullifierContained in V1's set
+    //   Step 2 (Effect): _addNullifierV2 — inserts into V2's own set
+    //   Step 3 (Interact): forwardEmergencyCall on V1 forwarder
+    //
+    // The external call (step 3) cannot re-enter to bypass the nullifier
+    // insert (step 2) because step 2 happens first and lock(this) is held
+    // by the outer forwardCall context.
+
+    void _migrateV1(
+        uint{this} nullifier,
+        uint{this} rootV1,
+        uint{this} logicRefV1,
+        address{this} forwarderV1,
+        uint{this} amount
+    ) throws (ResourceAlreadyConsumed, NullifierAlreadyExists, InvalidCommitmentRootV1,
+              InvalidLogicRefV1, InvalidForwarderV1) {
+
+        // Check: nullifier must NOT be in V1's nullifier set.
+        INullifierChecker paV1Null = INullifierChecker(_PROTOCOL_ADAPTER_V1);
+        bool alreadyInV1 = paV1Null.isNullifierContained(nullifier);
+        if (alreadyInV1) {
+            throw ResourceAlreadyConsumed();
+        }
+
+        // Effect: insert nullifier into V2's own set BEFORE external call.
+        // FINDING 12: this is the critical CEI ordering. Reversing these
+        // two steps would allow re-entrant double-spend.
+        if (_nullifiersV2[nullifier]) {
+            throw NullifierAlreadyExists();
+        }
+        _nullifiersV2[nullifier] = true;
+
+        // Validate commitment root matches V1's captured final root.
+        if (rootV1 != _COMMITMENT_TREE_ROOT_V1) {
+            throw InvalidCommitmentRootV1();
+        }
+
+        // Validate forwarder address matches the V1 forwarder.
+        if (forwarderV1 != _ERC20_FORWARDER_V1) {
+            throw InvalidForwarderV1();
+        }
+
+        // Interact: call V1 forwarder to pull tokens into V2.
+        // LABEL NOTE: _ERC20_FORWARDER_V1 has {this} integrity.
+        // The call result is discarded (we only care about the token transfer).
+        IEmergencyForwarder fwdV1 = IEmergencyForwarder(_ERC20_FORWARDER_V1);
+        bytes{this} callInput = endorse(bytes(0), sender -> this);
+        atomic {
+            fwdV1.forwardEmergencyCall(callInput);
+        } rescue * {
+            assert false;
+        }
+    }
+}
+
+// ============================================================
+// ERC20ForwarderV3Core — Models V3 with the COMMITMENT ROOT BUG
+// ============================================================
+//
+// V3 inherits all of V2's logic and adds migration of V2 resources.
+//
+// THE BUG (line 77 of ERC20ForwarderV3.sol):
+//   _COMMITMENT_TREE_ROOT_V2 = ICommitmentTree(_PROTOCOL_ADAPTER_V1)
+//                                              ^^^^^^^^^^^^^^^^
+//   Correct code would be:
+//   _COMMITMENT_TREE_ROOT_V2 = ICommitmentTree(_PROTOCOL_ADAPTER_V2)
+//
+// In SCIF, this bug is made visible because the developer must write
+// an explicit endorsement. The endorsement comment documents the SOURCE
+// of the value. Below we show BOTH the buggy version and the correct version.
+//
+// FINDING 11 — THE V3 CONSTRUCTOR BUG:
+//
+// Buggy constructor (what the code actually does):
+//   uint rootReadFromPA_V1 = paV1Tree.latestCommitmentTreeRoot()
+//   _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootReadFromPA_V1, sender->this)
+//   // WRONG: rootReadFromPA_V1 came from _PROTOCOL_ADAPTER_V1, not V2!
+//
+// The field name says "FROM_PA_V2" but the endorsed value comes from PA_V1.
+// SCIF cannot catch this at the type level (both are uint{this} after endorse)
+// but the ENDORSEMENT COMMENT makes the source explicit, which a reviewer
+// scanning all endorse() calls would immediately flag.
+//
+// CONSEQUENCE: _COMMITMENT_TREE_ROOT_FROM_PA_V2 holds V1's root.
+// Any V2 resource created after V1's last root will have rootV2 ≠ stored root,
+// causing _migrateV2 to revert with InvalidMigrationCommitmentTreeRootV2.
+// Those resources are PERMANENTLY UNMIGRABLE from V3.
+
+contract ERC20ForwarderV3Core {
+
+    // Addresses of V1, V2, and V3 protocol adapters and forwarders.
+    address{this} _PROTOCOL_ADAPTER_V1;
+    address{this} _PROTOCOL_ADAPTER_V2;
+    address{this} _PROTOCOL_ADAPTER_V3;
+    address{this} _ERC20_FORWARDER_V1;
+    address{this} _ERC20_FORWARDER_V2;
+
+    // V1 migration data (captured at V2 construction, inherited).
+    uint{this} _COMMITMENT_TREE_ROOT_V1;
+    uint{this} _LOGIC_REFERENCE_V1;
+
+    // V2 migration data (should be captured from PA_V2, but BUG reads from PA_V1).
+    //
+    // FIELD NAMING INTENT: this field should hold V2's final commitment root.
+    // ACTUAL BUG: in the real contract, it holds V1's root (wrong PA read).
+    //
+    // In SCIF, when you write the endorsement, you must name the source variable.
+    // This forces the reviewer to see:
+    //   uint{this} _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootReadFromPA_V1, ...)
+    //   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^        ^^^^^^^^^^^^^^^^
+    //   Name says "from V2"                                   Value came from V1
+    uint{this} _COMMITMENT_TREE_ROOT_FROM_PA_V2;
+    uint{this} _LOGIC_REFERENCE_V2;
+
+    // Emergency governance.
+    address{this} _EMERGENCY_COMMITTEE;
+    address{this} _emergencyCaller;
+
+    // Nullifier sets for V1 and V2 migrated resources.
+    map(uint, bool) _nullifiersV2;
+    map(uint, bool) _nullifiersV3;
+
+    // --- Exceptions ---
+
+    exception UnauthorizedCaller();
+    exception EmergencyCallerNotSet();
+    exception EmergencyCallerAlreadySet();
+    exception ProtocolAdapterNotStopped();
+    exception ResourceAlreadyConsumed();
+    exception InvalidCommitmentRootV2();
+    exception InvalidLogicRefV2();
+    exception InvalidForwarderV2();
+    exception NullifierAlreadyExists();
+    exception ZeroAddressNotAllowed();
+
+    // --- BUGGY Constructor (models what the real V3 contract does) ---
+    //
+    // The real V3 constructor reads _COMMITMENT_TREE_ROOT_V2 from
+    // _PROTOCOL_ADAPTER_V1 instead of _PROTOCOL_ADAPTER_V2.
+    //
+    // In SCIF the endorsement comment is the ONLY place where the source
+    // is explicitly documented. This makes the bug reviewer-visible:
+    //
+    //   _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootReadFromPA_V1, sender -> this)
+    //   // ^^^ WRONG: rootReadFromPA_V1 read from _PROTOCOL_ADAPTER_V1
+    //   // CORRECT would be: endorse(rootReadFromPA_V2, sender -> this)
+
+    constructor(
+        address paV3Addr,
+        address committeeAddr,
+        address paV1Addr,
+        address fwdV1Addr,
+        address paV2Addr,
+        address fwdV2Addr
+    ) {
+        _EMERGENCY_COMMITTEE = endorse(committeeAddr, sender -> this);
+        _PROTOCOL_ADAPTER_V1 = endorse(paV1Addr, sender -> this);
+        _PROTOCOL_ADAPTER_V2 = endorse(paV2Addr, sender -> this);
+        _PROTOCOL_ADAPTER_V3 = endorse(paV3Addr, sender -> this);
+        _ERC20_FORWARDER_V1 = endorse(fwdV1Addr, sender -> this);
+        _ERC20_FORWARDER_V2 = endorse(fwdV2Addr, sender -> this);
+        _emergencyCaller = endorse(address(0), sender -> this);
+        // Initialize with placeholder zero values; will be set after super().
+        _COMMITMENT_TREE_ROOT_V1 = endorse(0, sender -> this);
+        _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(0, sender -> this);
+        _LOGIC_REFERENCE_V2 = endorse(0, sender -> this);
+        _LOGIC_REFERENCE_V1 = endorse(0, sender -> this);
+        super();
+
+        // --- V1 root capture (correct) ---
+        // SCIF requires super() before any method calls.
+        IProtocolAdapterEmergencyCheck paV1Check = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V1);
+        bool v1Stopped = paV1Check.isEmergencyStopped();
+        if (!v1Stopped) {
+            assert false;
+        }
+        ICommitmentTreeReader paV1Tree = ICommitmentTreeReader(_PROTOCOL_ADAPTER_V1);
+        uint rootFromPA_V1 = paV1Tree.latestCommitmentTreeRoot();
+        _COMMITMENT_TREE_ROOT_V1 = endorse(rootFromPA_V1, sender -> this);
+
+        // --- V2 root capture (BUGGY — reads from PA_V1 instead of PA_V2) ---
+        //
+        // FINDING 11: The real contract has this bug.
+        // The line below endorses rootReadFromPA_V1 into _COMMITMENT_TREE_ROOT_FROM_PA_V2.
+        // The variable name "_COMMITMENT_TREE_ROOT_FROM_PA_V2" and the endorsement
+        // source variable "rootReadFromPA_V1_again" are CONTRADICTORY.
+        // A reviewer auditing all endorse() calls would flag this mismatch.
+        //
+        // --- BUGGY VERSION (what the real contract does) ---
+        ICommitmentTreeReader paV1TreeAgain = ICommitmentTreeReader(_PROTOCOL_ADAPTER_V1);
+        uint rootReadFromPA_V1_again = paV1TreeAgain.latestCommitmentTreeRoot();
+        // BUG: endorsing a value read from PA_V1 into a field meant for PA_V2's root.
+        // The reviewer sees: source = PA_V1, destination = _COMMITMENT_TREE_ROOT_FROM_PA_V2.
+        _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootReadFromPA_V1_again, sender -> this);
+        //
+        // --- CORRECT VERSION (what it should be) ---
+        // IProtocolAdapterEmergencyCheck paV2Check2 = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V2);
+        // bool v2Stopped2 = paV2Check2.isEmergencyStopped();
+        // if (!v2Stopped2) { assert false; }
+        // ICommitmentTreeReader paV2Tree = ICommitmentTreeReader(_PROTOCOL_ADAPTER_V2);
+        // uint rootFromPA_V2 = paV2Tree.latestCommitmentTreeRoot();
+        // _COMMITMENT_TREE_ROOT_FROM_PA_V2 = endorse(rootFromPA_V2, sender -> this);
+
+        // Check V2 is stopped (this check exists in the real contract, but the
+        // root is still read from the wrong PA above).
+        IProtocolAdapterEmergencyCheck paV2Check = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V2);
+        bool v2Stopped = paV2Check.isEmergencyStopped();
+        if (!v2Stopped) {
+            assert false;
+        }
+
+        ICommitmentTreeReader fwdV2LogicReader = ICommitmentTreeReader(_ERC20_FORWARDER_V2);
+        uint logicRefV2 = fwdV2LogicReader.latestCommitmentTreeRoot();
+        _LOGIC_REFERENCE_V2 = endorse(logicRefV2, sender -> this);
+    }
+
+    // --- _migrateV2 ---
+    //
+    // Migrates a V2 resource into V3 by:
+    //   1. Checking nullifier not already in V2's PA nullifier set.
+    //   2. Adding nullifier to V3's local set (CEI: effect before interaction).
+    //   3. Validating rootV2 against _COMMITMENT_TREE_ROOT_FROM_PA_V2.
+    //      BUG: this field holds V1's root, so the check will fail for any
+    //      V2 resource created after V1's final root. Those resources can
+    //      never be migrated.
+    //   4. Calling V2's forwardEmergencyCall to pull tokens.
+    //
+    // FINDING 11 CONSEQUENCE:
+    //   The check `if (rootV2 != _COMMITMENT_TREE_ROOT_FROM_PA_V2)` will
+    //   ALWAYS FAIL for V2 resources committed after V1's last root,
+    //   because _COMMITMENT_TREE_ROOT_FROM_PA_V2 holds V1's root value.
+    //   Those resources are permanently locked.
+
+    void _migrateV2(
+        uint{this} nullifier,
+        uint{this} rootV2,
+        uint{this} logicRefV2,
+        address{this} forwarderV2,
+        uint{this} amount
+    ) throws (ResourceAlreadyConsumed, NullifierAlreadyExists, InvalidCommitmentRootV2,
+              InvalidLogicRefV2, InvalidForwarderV2) {
+
+        // Check: nullifier not in V2's PA nullifier set.
+        INullifierChecker paV2Null = INullifierChecker(_PROTOCOL_ADAPTER_V2);
+        bool alreadyInV2 = paV2Null.isNullifierContained(nullifier);
+        if (alreadyInV2) {
+            throw ResourceAlreadyConsumed();
+        }
+
+        // Effect: insert nullifier into V3's local set BEFORE external call.
+        // CEI pattern — same as V2's _migrateV1 (FINDING 12 confirmed here too).
+        if (_nullifiersV3[nullifier]) {
+            throw NullifierAlreadyExists();
+        }
+        _nullifiersV3[nullifier] = true;
+
+        // Validate root — THIS IS WHERE THE BUG MANIFESTS.
+        // rootV2 (caller-supplied, user's V2 resource root) will not equal
+        // _COMMITMENT_TREE_ROOT_FROM_PA_V2 (which holds V1's final root)
+        // for any V2 resource created after V1's last block.
+        if (rootV2 != _COMMITMENT_TREE_ROOT_FROM_PA_V2) {
+            throw InvalidCommitmentRootV2();
+        }
+
+        // Validate forwarder matches the stored V2 forwarder.
+        if (forwarderV2 != _ERC20_FORWARDER_V2) {
+            throw InvalidForwarderV2();
+        }
+
+        // Interact: call V2 forwarder to pull tokens into V3.
+        IEmergencyForwarder fwdV2 = IEmergencyForwarder(_ERC20_FORWARDER_V2);
+        bytes{this} callInput = endorse(bytes(0), sender -> this);
+        atomic {
+            fwdV2.forwardEmergencyCall(callInput);
+        } rescue * {
+            assert false;
+        }
+    }
+
+    // --- Emergency governance (from EmergencyMigratableBase) ---
+    //
+    // Included here to keep V3 self-contained and show the full trust chain.
+    // FINDING 8 applies: committee has unconditional power to appoint draining address.
+
+    @public
+    void setEmergencyCaller(address newEmergencyCaller)
+        throws (UnauthorizedCaller, ZeroAddressNotAllowed, EmergencyCallerAlreadySet, ProtocolAdapterNotStopped) {
+
+        if (sender != _EMERGENCY_COMMITTEE) {
+            throw UnauthorizedCaller();
+        }
+        if (newEmergencyCaller == address(0)) {
+            throw ZeroAddressNotAllowed();
+        }
+        if (_emergencyCaller != address(0)) {
+            throw EmergencyCallerAlreadySet();
+        }
+
+        // V3's own PA must be stopped.
+        // FIX (MED-3): Uses _PROTOCOL_ADAPTER_V3 instead of V2.
+        // The real Solidity checks inherited _PROTOCOL_ADAPTER (set to V3's PA).
+        IProtocolAdapterEmergencyCheck paV3Check = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V3);
+        bool stopped = paV3Check.isEmergencyStopped();
+        if (!stopped) {
+            throw ProtocolAdapterNotStopped();
+        }
+
+        address{this} endorsedCaller = endorse(newEmergencyCaller, sender -> this);
+        _emergencyCaller = endorsedCaller;
+    }
+
+    @public
+    bytes forwardEmergencyCall(bytes input)
+        throws (EmergencyCallerNotSet, UnauthorizedCaller, ProtocolAdapterNotStopped) {
+
+        if (_emergencyCaller == address(0)) {
+            throw EmergencyCallerNotSet();
+        }
+        if (sender != _emergencyCaller) {
+            throw UnauthorizedCaller();
+        }
+
+        // FIX (MED-3): Uses _PROTOCOL_ADAPTER_V3 instead of V2.
+        IProtocolAdapterEmergencyCheck paV3Check = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER_V3);
+        bool stopped = paV3Check.isEmergencyStopped();
+        if (!stopped) {
+            throw ProtocolAdapterNotStopped();
+        }
+
+        bytes{this} endorsedInput = endorse(input, sender -> this);
+
+        // GAP-3 NOTE: The real V3 dispatches endorsedInput to _forwardCall,
+        // which routes to _migrateV1, _migrateV2, Wrap, or Unwrap.
+        // This simplified model returns endorsedInput directly.
+        // A complete model would decode callType from endorsedInput and dispatch.
+        lock(this) {
+            atomic {
+                result = endorsedInput;
+            } rescue * {
+                result = endorsedInput;
+            }
+        }
+    }
+
+    // --- View helpers ---
+
+    @public
+    address getProtocolAdapterV2() {
+        result = _PROTOCOL_ADAPTER_V2;
+    }
+
+    @public
+    uint getCommitmentRootFromPaV2() {
+        result = _COMMITMENT_TREE_ROOT_FROM_PA_V2;
+    }
+
+    @public
+    uint getCommitmentRootV1() {
+        result = _COMMITMENT_TREE_ROOT_V1;
+    }
+}

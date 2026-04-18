@@ -1,0 +1,350 @@
+// ERC20Forwarder — SCIF model of the Anoma ERC20Forwarder contract.
+//
+// Original: anomapay-erc20-forwarder/contracts/src/ERC20Forwarder.sol
+//
+// SCIF limitations applied:
+//   - No struct types: WrapData / UnwrapData fields passed individually
+//   - No abi.decode: modeled as parameter passing
+//   - No bytes32: use uint
+//   - No final fields in constructors: use address{this} + runtime check
+//   - Interfaces cannot declare exceptions
+//
+// What SCIF enforces here:
+//   1. All user-supplied wrap/unwrap parameters have {sender} label until endorsed
+//   2. Token address and amount, after PA access check, are endorsed to {this}
+//   3. lock(this) on external token calls prevents reentrancy PC label degradation
+//   4. Balance invariant (balanceBefore/balanceAfter) protected by lock(this)
+//   5. Permit2 call (external, can fail) isolated in atomic/rescue block
+//
+// IFC Label glossary:
+//   {this}   = contract-level integrity (trusted: set/computed by this contract)
+//   {sender} = caller's integrity (untrusted until endorsed after access check)
+//   {any}    = fully untrusted (public)
+
+// ============================================================
+// IPermit2 — minimal interface for Permit2.permitWitnessTransferFrom
+// ============================================================
+//
+// The real Permit2 takes struct types. SCIF has no structs, so we flatten.
+// Key IFC insight: the function receives endorsed data from this contract
+// (token, amount, owner all have {this} label when called from _wrap).
+// Permit2 validates the user signature internally.
+// No exception in interface (SCIF limitation).
+
+interface IPermit2 {
+    @public void permitWitnessTransferFrom(
+        address token,
+        uint amount,
+        uint nonce,
+        uint deadline,
+        address owner,
+        uint witness,
+        bytes signature
+    );
+}
+
+// ============================================================
+// IToken — minimal ERC20 interface (balanceOf + transfer)
+// ============================================================
+//
+// transfer{from -> this}: caller must hold {from} authority.
+// When this contract calls transfer(address(this), ...), it holds
+// {this} authority over its own balance — label requirement satisfied.
+// No exceptions in interface (SCIF limitation — limitation #3).
+
+interface IToken {
+    @public uint balanceOf(address account);
+    @public void transfer{from -> this}(final address from, address to, uint amount);
+}
+
+// ============================================================
+// ERC20Forwarder
+// ============================================================
+
+contract ERC20Forwarder {
+
+    // Protocol adapter address — {this} integrity (set once in constructor)
+    address{this} _PROTOCOL_ADAPTER;
+
+    // Expected logic reference (bytes32 in Solidity → uint here; limitation #2)
+    uint{this} _LOGIC_REF;
+
+    // Permit2 canonical address — trusted constant, stored as {this}
+    address{this} _PERMIT2_ADDR;
+
+    // CallType constants: 0 = Wrap, 1 = Unwrap (enum → uint; limitation #2)
+    uint{this} _CALL_TYPE_WRAP;
+    uint{this} _CALL_TYPE_UNWRAP;
+
+    // --- Exceptions ---
+    // (must appear before event declarations — SCIF parser order requirement)
+
+    exception UnauthorizedCaller();
+    exception UnauthorizedLogicRef();
+    exception BalanceMismatch(uint expected, uint actual);
+    exception InvalidCallType();
+    exception WrapFailed();
+    exception UnwrapFailed();
+
+    // --- Events ---
+
+    event Wrapped(address token, address from, uint amount);
+    event Unwrapped(address token, address to, uint amount);
+
+    // --- Constructor ---
+
+    constructor(address protocolAdapter, uint logicRef, address permit2Addr) {
+        _PROTOCOL_ADAPTER = endorse(protocolAdapter, sender -> this);
+        _LOGIC_REF        = endorse(logicRef, sender -> this);
+        _PERMIT2_ADDR     = endorse(permit2Addr, sender -> this);
+        _CALL_TYPE_WRAP   = 0;
+        _CALL_TYPE_UNWRAP = 1;
+        super();
+    }
+
+    // ============================================================
+    // forwardCall — public entry point (mirrors ForwarderBase pattern)
+    // ============================================================
+    //
+    // @public means {sender -> this; this}:
+    //   - anyone may call
+    //   - control flow is auto-endorsed to contract integrity
+    //   - holds reentrancy lock at {this}
+    //
+    // Access control: sender must equal _PROTOCOL_ADAPTER.
+    // After this check, we endorse all PA-supplied params to {this}.
+    //
+    // IFC FINDING (Phase 3, Finding A):
+    //   Without the sender == _PROTOCOL_ADAPTER check, any caller could
+    //   supply arbitrary callType/token/amount and pass them into _wrap/_unwrap.
+    //   SCIF forces the endorsement to be explicit; the developer must
+    //   justify WHY these endorsements are sound.
+    //   Justification: PA endorses its inputs via ZK proof before calling us.
+
+    @public
+    bytes{this} forwardCall(
+        uint logicRef,
+        uint callType,
+        address token,
+        uint amount,
+        uint nonce,
+        uint deadline,
+        address owner,
+        uint witness,
+        bytes signature,
+        address receiver
+    ) throws (UnauthorizedCaller, UnauthorizedLogicRef,
+              BalanceMismatch, InvalidCallType, WrapFailed, UnwrapFailed) {
+
+        // Access control — only the Protocol Adapter may call
+        if (sender != _PROTOCOL_ADAPTER) {
+            throw UnauthorizedCaller();
+        }
+
+        // Endorse all PA-supplied parameters to {this}.
+        // Justification: PA is the trusted caller (checked above);
+        // PA itself validated inputs via ZK proof before calling us.
+        uint{this}    eLogicRef  = endorse(logicRef, sender -> this);
+        uint{this}    eCallType  = endorse(callType, sender -> this);
+        address{this} eToken     = endorse(token, sender -> this);
+        uint{this}    eAmount    = endorse(amount, sender -> this);
+        uint{this}    eNonce     = endorse(nonce, sender -> this);
+        uint{this}    eDeadline  = endorse(deadline, sender -> this);
+        address{this} eOwner     = endorse(owner, sender -> this);
+        uint{this}    eWitness   = endorse(witness, sender -> this);
+        bytes{this}   eSig       = endorse(signature, sender -> this);
+        address{this} eReceiver  = endorse(receiver, sender -> this);
+
+        // Logic reference check
+        if (_LOGIC_REF != eLogicRef) {
+            throw UnauthorizedLogicRef();
+        }
+
+        result = _forwardCall(
+            eCallType, eToken, eAmount,
+            eNonce, eDeadline, eOwner, eWitness, eSig,
+            eReceiver
+        );
+    }
+
+    // ============================================================
+    // _forwardCall — internal dispatch + balance invariant
+    // ============================================================
+    //
+    // IFC FINDING (Phase 3, Finding B — Balance Invariant):
+    //   The balance invariant requires reading balanceBefore BEFORE the
+    //   external token call and balanceAfter AFTER it.
+    //
+    //   Without lock(this):
+    //     - balanceBefore is computed at PC {this}
+    //     - external call (_wrap / _unwrap) degrades PC to {any}
+    //       (any reentrant call could modify state between the two reads)
+    //     - balanceAfter is then at PC {any}
+    //     - balanceDelta = {any} - {any} = {any}
+    //     - comparing {any} != eAmount{this} → SCIF REJECTS (label mismatch)
+    //
+    //   With lock(this):
+    //     - The lock ensures PC remains at {this} throughout the block
+    //     - balanceBefore, balanceAfter, and balanceDelta all have {this} label
+    //     - The invariant check is type-correct
+    //
+    //   This is EXACTLY why the original Solidity uses nonReentrant at the
+    //   forwardCall level (wrapping the entire wrap/unwrap logic).
+    //   SCIF makes the need for the lock visible at the _forwardCall level.
+    //
+    // IFC FINDING (Phase 3, Finding C — Lock Scope):
+    //   The lock must cover BOTH the pre-call balance read AND the external
+    //   call. If we read balanceBefore outside the lock, SCIF flags the
+    //   balanceDelta computation as potentially unsound.
+
+    bytes{this} _forwardCall(
+        uint{this} callType,
+        address{this} token,
+        uint{this} amount,
+        uint{this} nonce,
+        uint{this} deadline,
+        address{this} owner,
+        uint{this} witness,
+        bytes{this} signature,
+        address{this} receiver
+    ) throws (BalanceMismatch, InvalidCallType, WrapFailed, UnwrapFailed) {
+
+        lock(this) {
+            IToken tok = IToken(token);
+
+            // Read balance BEFORE external call — inside the lock
+            uint{this} balanceBefore = tok.balanceOf(address(this));
+            uint{this} balanceDelta  = 0;
+
+            if (callType == _CALL_TYPE_WRAP) {
+                // IFC FINDING (Phase 3, Finding D — Permit2 Trust):
+                //   _wrap calls Permit2 (external, canonically trusted address).
+                //   Permit2 was endorsed at constructor time (_PERMIT2_ADDR has
+                //   {this} label). However Permit2 validates a user-supplied
+                //   signature internally. The signature bytes (eSig) are {this}
+                //   labeled because we endorsed them from PA, but their semantic
+                //   validity is determined by Permit2's internal logic.
+                //   SCIF ensures the call happens inside lock(this) so any
+                //   reentrancy from Permit2 is blocked.
+                _wrap(token, amount, nonce, deadline, owner, witness, signature);
+                uint{this} balanceAfterWrap = tok.balanceOf(address(this));
+                balanceDelta = balanceAfterWrap - balanceBefore;
+            } else {
+                if (callType == _CALL_TYPE_UNWRAP) {
+                    // _unwrap calls token.transfer — external call.
+                    // Also protected by lock(this) above.
+                    _unwrap(token, amount, receiver);
+                    uint{this} balanceAfterUnwrap = tok.balanceOf(address(this));
+                    balanceDelta = balanceBefore - balanceAfterUnwrap;
+                } else {
+                    throw InvalidCallType();
+                }
+            }
+
+            // Balance invariant: delta must equal declared amount.
+            // IFC: both {this} — comparison is valid.
+            if (balanceDelta != amount) {
+                throw BalanceMismatch(amount, balanceDelta);
+            }
+        }
+
+        // Return empty bytes (Solidity: output = "")
+        result = signature;  // placeholder — SCIF requires a result of type bytes{this}
+    }
+
+    // ============================================================
+    // _wrap — Permit2 pull: user -> forwarder
+    // ============================================================
+    //
+    // All params are {this} (endorsed in forwardCall).
+    // The Permit2 call is atomic/rescue because it can revert
+    // (bad signature, expired deadline, nonce already used).
+    //
+    // IFC FINDING (Phase 3, Finding E — Permit2 Isolation):
+    //   atomic/rescue ensures that if Permit2 reverts, the state changes
+    //   made before the call (none in _wrap, but balanceBefore in the
+    //   parent scope) are rolled back. This mirrors the Solidity pattern
+    //   where the entire transaction reverts on Permit2 failure.
+    //
+    //   Without atomic/rescue, a partial-failure scenario where Permit2
+    //   reverts but other state has already been modified could leave the
+    //   contract in an inconsistent state. In the original Solidity this
+    //   is handled by the EVM revert mechanism. SCIF makes the isolation
+    //   requirement explicit.
+
+    void _wrap(
+        address{this} token,
+        uint{this} amount,
+        uint{this} nonce,
+        uint{this} deadline,
+        address{this} owner,
+        uint{this} witness,
+        bytes{this} signature
+    ) throws (WrapFailed) {
+
+        IPermit2 permit2 = IPermit2(_PERMIT2_ADDR);
+
+        atomic {
+            permit2.permitWitnessTransferFrom(
+                token,
+                amount,
+                nonce,
+                deadline,
+                owner,
+                witness,
+                signature
+            );
+        } rescue * {
+            throw WrapFailed();
+        }
+
+        // Emit event — all args are {this}, safe to log.
+        // Protected from reentrancy-events by lock(this) in _forwardCall.
+        emit Wrapped(token, owner, amount);
+    }
+
+    // ============================================================
+    // _unwrap — SafeERC20 push: forwarder -> receiver
+    // ============================================================
+    //
+    // IFC FINDING (Phase 3, Finding F — Transfer Authorization):
+    //   IToken.transfer{from -> this}(final address from, ...) requires
+    //   caller to hold {from} authority.
+    //
+    //   We call tok.transfer(address(this), receiver, amount):
+    //     from = address(this) — this contract's own address
+    //     The contract holds {this} authority over itself
+    //
+    //   This is IFC-correct: the forwarder is authorizing a transfer
+    //   FROM its own balance. The tokens were deposited by _wrap, so
+    //   the forwarder legitimately owns them.
+    //
+    //   In the original Solidity, SafeERC20.safeTransfer is used which
+    //   calls transfer(receiver, amount) implicitly using msg.sender as
+    //   the from address. The IFC model makes the authorization chain
+    //   explicit: forwarder address == from == authorizer.
+
+    void _unwrap(
+        address{this} token,
+        uint{this} amount,
+        address{this} receiver
+    ) throws (UnwrapFailed) {
+
+        IToken tok = IToken(token);
+
+        atomic {
+            tok.transfer(address(this), receiver, amount);
+        } rescue * {
+            throw UnwrapFailed();
+        }
+
+        emit Unwrapped(token, receiver, amount);
+    }
+
+    // --- View ---
+
+    @public
+    address{this} getProtocolAdapter() {
+        result = _PROTOCOL_ADAPTER;
+    }
+}
