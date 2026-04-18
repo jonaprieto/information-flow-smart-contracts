@@ -12,8 +12,6 @@ on:
       - ".github/workflows/build-docs.yml"
   workflow_dispatch:
 
-# So the README's "Download latest PDF" link always points at the freshest
-# successful build on main, keep a stable run name.
 run-name: "report.pdf (${{ github.sha }})"
 
 jobs:
@@ -26,33 +24,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install TeX Live (XeLaTeX + required packages)
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            texlive-xetex \
+            texlive-latex-extra \
+            texlive-fonts-extra \
+            texlive-science \
+            texlive-pictures \
+            latexmk \
+            lmodern \
+            fontconfig \
+            unzip
+
       - name: Cache JetBrains Mono NL fonts
         id: jbmono-cache
         uses: actions/cache@v4
         with:
-          path: ~/.fonts/jetbrains-mono
+          path: ~/.local/share/fonts/jetbrains-mono
           key: jetbrains-mono-nl-2.304
 
       - name: Install JetBrains Mono NL fonts
         if: steps.jbmono-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p ~/.fonts/jetbrains-mono
+          mkdir -p ~/.local/share/fonts/jetbrains-mono
           curl -fsSL -o /tmp/jbmono.zip \
             https://download.jetbrains.com/fonts/JetBrainsMono-2.304.zip
-          unzip -q -j /tmp/jbmono.zip "fonts/ttf/JetBrainsMonoNL-*.ttf" -d ~/.fonts/jetbrains-mono
-          fc-cache -f
+          unzip -q -j /tmp/jbmono.zip "fonts/ttf/JetBrainsMonoNL-*.ttf" \
+            -d ~/.local/share/fonts/jetbrains-mono
 
       - name: Refresh font cache
-        if: steps.jbmono-cache.outputs.cache-hit == 'true'
-        run: fc-cache -f
+        run: |
+          fc-cache -f ~/.local/share/fonts
+          fc-list | grep -i jetbrains | head -5 || (echo "JetBrains Mono NL not found" && exit 1)
 
-      - name: Compile with XeLaTeX
-        uses: xu-cheng/latex-action@v3
-        with:
-          working_directory: doc
-          root_file: report.tex
-          latexmk_use_xelatex: true
-          extra_fonts: ~/.fonts/jetbrains-mono/*.ttf
+      - name: Compile report with XeLaTeX (two passes for cross-refs)
+        working-directory: doc
+        run: |
+          xelatex -interaction=nonstopmode -halt-on-error report.tex
+          xelatex -interaction=nonstopmode -halt-on-error report.tex
 
       - name: Upload PDF artefact
         uses: actions/upload-artifact@v4
@@ -60,3 +71,11 @@ jobs:
           name: research-report
           path: doc/report.pdf
           retention-days: 90
+
+      - name: Upload LaTeX log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latex-log
+          path: doc/report.log
+          retention-days: 7
