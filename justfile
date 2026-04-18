@@ -4,13 +4,38 @@
 #   - Java 21 (temurin recommended)
 #   - Gradle (via SCIF's wrapper)
 #   - SCIF compiler cloned at $SCIF_DIR (default: ../forks/SCIF)
+#
+# Vendored references (as git submodules under third_party/):
+#   - anoma/pa-evm                    original PA Solidity
+#   - anoma/anomapay-erc20-forwarder  original forwarder Solidity
+# Run `just init` once after cloning to fetch them.
 
 SCIF_DIR := env("SCIF_DIR", justfile_directory() + "/../forks/SCIF")
 OUT_DIR := justfile_directory() + "/tmp"
+PA_SRC := justfile_directory() + "/third_party/pa-evm/contracts/src"
+FWD_SRC := justfile_directory() + "/third_party/anomapay-erc20-forwarder/contracts/src"
 
 # List all available recipes
 default:
     @just --list
+
+# Initialise / update the vendored contract submodules (run once after clone)
+init:
+    @echo "Initialising submodules (pa-evm, anomapay-erc20-forwarder)..."
+    git submodule update --init --recursive
+    @echo "OK: contracts available at third_party/pa-evm and third_party/anomapay-erc20-forwarder"
+
+# Fast-forward vendored submodules to their upstream main branch
+update-contracts:
+    git submodule update --remote --merge third_party/pa-evm
+    git submodule update --remote --merge third_party/anomapay-erc20-forwarder
+
+# Show the paths of the vendored Solidity files (useful for referencing)
+show-contracts:
+    @echo "Protocol Adapter:"
+    @find "{{PA_SRC}}" -name '*.sol' 2>/dev/null | sed 's|{{PA_SRC}}/||' | sed 's|^|  |' || echo "  (run 'just init' first)"
+    @echo "ERC20 Forwarder:"
+    @find "{{FWD_SRC}}" -name '*.sol' 2>/dev/null | sed 's|{{FWD_SRC}}/||' | sed 's|^|  |' || echo "  (run 'just init' first)"
 
 # Check that Java 21 and SCIF compiler are available
 check:
