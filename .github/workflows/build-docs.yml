@@ -1,0 +1,62 @@
+name: Build Research Report (PDF)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "doc/**"
+      - ".github/workflows/build-docs.yml"
+  pull_request:
+    paths:
+      - "doc/**"
+      - ".github/workflows/build-docs.yml"
+  workflow_dispatch:
+
+# So the README's "Download latest PDF" link always points at the freshest
+# successful build on main, keep a stable run name.
+run-name: "report.pdf (${{ github.sha }})"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache JetBrains Mono NL fonts
+        id: jbmono-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.fonts/jetbrains-mono
+          key: jetbrains-mono-nl-2.304
+
+      - name: Install JetBrains Mono NL fonts
+        if: steps.jbmono-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.fonts/jetbrains-mono
+          curl -fsSL -o /tmp/jbmono.zip \
+            https://download.jetbrains.com/fonts/JetBrainsMono-2.304.zip
+          unzip -q -j /tmp/jbmono.zip "fonts/ttf/JetBrainsMonoNL-*.ttf" -d ~/.fonts/jetbrains-mono
+          fc-cache -f
+
+      - name: Refresh font cache
+        if: steps.jbmono-cache.outputs.cache-hit == 'true'
+        run: fc-cache -f
+
+      - name: Compile with XeLaTeX
+        uses: xu-cheng/latex-action@v3
+        with:
+          working_directory: doc
+          root_file: report.tex
+          latexmk_use_xelatex: true
+          extra_fonts: ~/.fonts/jetbrains-mono/*.ttf
+
+      - name: Upload PDF artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-report
+          path: doc/report.pdf
+          retention-days: 90
