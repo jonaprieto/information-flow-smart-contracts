@@ -113,6 +113,8 @@
   tabsize=2,
   captionpos=b,
   xleftmargin=1.5em,
+  xrightmargin=0.5em,
+  linewidth=\dimexpr\linewidth-2em\relax,
 }
 
 % Compact two-column listing styles (smaller font, no numbers, tight frame).
@@ -174,6 +176,8 @@
   tabsize=4,
   captionpos=b,
   xleftmargin=1.5em,
+  xrightmargin=0.5em,
+  linewidth=\dimexpr\linewidth-2em\relax,
 }
 
 %% ============================================================
@@ -247,11 +251,16 @@ arise when applying IFC to ZK-backed smart contracts.
 We rewrote the security-critical core of two Anoma smart contracts ---
 the EVM Protocol Adapter (PA) and the ERC20 Forwarder --- in
 SCIF~\cite{scif2025}, a language that compiles to Solidity and forces
-every trust decision to be written down explicitly. The original
-Solidity is silent about where untrusted user data becomes trusted;
-the SCIF models name every such point. Six models were produced,
-covering the PA, the forwarder, the emergency migration chain (V1--V3),
-and the cross-contract call between PA and forwarder.
+every trust decision to be written down explicitly.
+``Security-critical core'' means every code path that controls who may
+call what, where user-supplied data gains trust, where tokens move, and
+what prevents reentrancy --- roughly 60\% of Solidity functions by count,
+but close to 100\% of the paths that affect fund safety.
+The unmodeled remainder is view getters, gas simulation, event emission,
+and proof-aggregation mechanics, none of which affect trust flow.
+Six SCIF models were produced, covering the PA, the forwarder, the
+emergency migration chain (V1--V3), and the cross-contract call between
+PA and forwarder.
 
 \paragraph{What we found.}
 \begin{enumerate}
@@ -314,7 +323,8 @@ existing Nethermind and Informal Systems audits. See
 %% ============================================================
 
 Smart contract security audits typically proceed through a combination of
-automated static analysis (Slither, Mythril, Halmos), formal verification of
+automated static analysis (Slither~\cite{slither}, Mythril~\cite{mythril},
+Halmos~\cite{halmos}), formal verification of
 isolated invariants, and manual review. Each of these approaches shares a
 fundamental limitation: trust is \emph{implicit}. A Solidity variable carrying
 user-supplied data is syntactically identical to a variable holding
@@ -548,8 +558,9 @@ in the report. There are only three ideas you need.
 \subsection{Three Labels}
 \label{sec:primer-labels}
 
-Every value in SCIF carries one of three labels that say \emph{who vouches
-for it}:
+Every value in SCIF carries a \emph{label} that says who vouches for it.
+Labels can name any principal (an address, a contract, etc.), but in
+practice three labels appear throughout the models in this report:
 
 \begin{description}
   \item[\texttt{\{this\}}] --- the \textbf{contract itself} guarantees this
@@ -624,10 +635,10 @@ Solidity equivalent.
 \midrule
 \texttt{address\{this\}} & \texttt{address} & Contract-trusted value. \\
 \texttt{uint\{sender\}} & \texttt{uint256} (calldata) & Caller-supplied, untrusted. \\
-\texttt{endorse(x, sender -> this)} & (nothing --- implicit) & Mark \texttt{x} as trusted. \\
+\texttt{endorse(x, sender -> this)} & (nothing --- implicit) & Mark \texttt{x} as trusted. Also supports a conditional form: \texttt{endorse(x, a -> b) if (cond)}. \\
 \addlinespace
 \texttt{lock(this) \{ ... \}} & \texttt{nonReentrant} scope & Keep trust across external calls. \\
-\texttt{atomic \{ ... \} rescue * \{ ... \}} & \texttt{try/catch} & Isolate failure; trust drops inside \texttt{rescue}. \\
+\texttt{atomic \{ ... \} rescue * \{ ... \}} & \texttt{try/catch} (external call) & Rollback on failure; trust drops inside \texttt{rescue}. SCIF also has \texttt{try/catch} for non-rolling-back exceptions. \\
 \addlinespace
 \texttt{@public} & \texttt{external} & Anyone can call; reentrancy-locked. \\
 \texttt{throw X()} & \texttt{revert X()} & Revert with a named error. \\
@@ -789,40 +800,8 @@ The \texttt{lock(this)} block at the bottom scopes the reentrancy
 protection to exactly the state writes and external call that need it ---
 if the scope were too narrow, SCIF would reject the program.
 
-\subsection{Running the SCIF Compiler}
-\label{sec:primer-running}
-
-The artefact repository provides a \texttt{justfile} and a GitHub Actions
-workflow for reproducing the analysis.
-
-\paragraph{Prerequisites.}
-\begin{itemize}
-  \item Java 21 (Temurin distribution recommended).
-  \item A checkout of the SCIF compiler from
-    \texttt{github.com/apl-cornell/SCIF}, placed at \texttt{\$SCIF\_DIR}
-    (default: \texttt{../forks/SCIF} relative to the artefact root).
-  \item The \texttt{just} command runner (\texttt{brew install just} on
-    macOS; package manager on Linux).
-\end{itemize}
-
-\paragraph{Common commands.}
-\begin{itemize}
-  \item \texttt{just check} --- verify that Java and the SCIF compiler are
-    reachable.
-  \item \texttt{just typecheck-all} --- run the SCIF type-checker over every
-    \texttt{.scif} file in the repository.
-  \item \texttt{just compile-all} --- compile every \texttt{.scif} file to
-    Solidity; output is written to \texttt{tmp/}.
-  \item \texttt{just typecheck forwarder/ForwarderBase.scif} --- type-check a
-    single model.
-\end{itemize}
-
-\paragraph{Continuous integration.}
-The workflow at \texttt{.github/workflows/scif-check.yml} runs
-\texttt{typecheck-all} and \texttt{compile-all} on every push and pull
-request, uploading the generated Solidity as a build artefact. Failures in
-either step fail the build, so the SCIF models stay in sync with the
-repository across contributions.
+Instructions for setting up the SCIF compiler and reproducing the
+analysis are in \cref{app:reproducibility}.
 
 %% ============================================================
 \section{Methodology}
@@ -909,13 +888,65 @@ circuit. Six appear in \texttt{ProtocolAdapterCore.scif} and ten appear in
 \subsection{CRIT-1: Emergency Committee Is a Single-Actor Fund Drain}
 \label{sec:crit1}
 
-\paragraph{Attack scenario.}
-The \texttt{\_EMERGENCY\_COMMITTEE} address (immutable, set at deploy time)
-calls \texttt{setEmergencyCaller(attackerAddr)} once the PA is stopped.
-The attacker's address immediately becomes \texttt{\_emergencyCaller}. One
-additional transaction calling \texttt{forwardEmergencyCall(input)} with a
-\texttt{Unwrap} calltype drains the forwarder's entire token balance. The
-complete attack is two transactions with no on-chain delay.
+\paragraph{The guards that exist.}
+The emergency path is \textbf{not unprotected}. The Solidity contracts
+enforce eight runtime checks across the two functions:
+
+\begin{table}[h]
+\centering
+\small
+\caption{All runtime guards on the emergency path
+  (\fwdrefR{bases/}{EmergencyMigratableForwarderBase.sol}{42}{69}).}
+\label{tab:emergency-guards}
+\begin{tabular}{@{}clll@{}}
+\toprule
+\textbf{\#} & \textbf{Function} & \textbf{Guard} & \textbf{What it rejects} \\
+\midrule
+1 & \texttt{setEmergencyCaller}   & \texttt{\_checkCaller(\_EMERGENCY\_COMMITTEE)}
+  & anyone except the committee \\
+2 & & \texttt{newEmergencyCaller != address(0)}
+  & zero-address appointment \\
+3 & & \texttt{\_emergencyCaller != address(0)}
+  & second appointment (write-once) \\
+4 & & \texttt{\_checkEmergencyStopped()}
+  & PA still running (not stopped) \\
+\addlinespace
+5 & \texttt{forwardEmergencyCall} & \texttt{\_emergencyCaller != address(0)}
+  & caller not yet appointed \\
+6 & & \texttt{\_checkCaller(\_emergencyCaller)}
+  & anyone except appointed caller \\
+7 & & \texttt{\_checkEmergencyStopped()}
+  & PA no longer stopped \\
+8 & & \texttt{nonReentrant}
+  & re-entrant calls \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Guards \#1 and \#6 correctly reject every address except the committee and
+the appointed caller, respectively. Guard \#3 ensures the committee can
+only appoint once. Guard \#4 ensures the PA must be stopped (a separate
+owner action) before any appointment can happen.
+
+\paragraph{What the finding is about.}
+The finding is \emph{not} that these guards are missing. It is that all
+eight guards can be satisfied by \textbf{one actor} in \textbf{two
+transactions} with \textbf{no enforced delay}:
+
+\begin{enumerate}
+  \item The PA owner calls \texttt{emergencyStop} (prerequisite --- the
+    committee cannot act while the PA is running).
+  \item The committee calls \texttt{setEmergencyCaller(drainerAddr)} ---
+    passes guards \#1--\#4 in one transaction.
+  \item \texttt{drainerAddr} calls
+    \texttt{forwardEmergencyCall(unwrapPayload)} --- passes guards
+    \#5--\#8 in the very next block.
+\end{enumerate}
+
+There is nothing in the contract that forces the committee to \emph{wait}
+between step~2 and step~3, \emph{announce} the appointment publicly, or
+obtain \emph{on-chain approval from a second party}. The access control
+is correct; the governance \emph{pacing} is absent.
 
 \paragraph{Affected code.}
 \begin{itemize}
@@ -928,44 +959,61 @@ complete attack is two transactions with no on-chain delay.
 \end{itemize}
 
 \paragraph{How SCIF surfaces this.}
-The label chain is single-step and unambiguous:
+SCIF's endorsement chain makes the single-step structure visible.
+The two SCIF listings below correspond to the Solidity functions in
+\cref{tab:emergency-guards}:
 
 \begin{lstlisting}[style=scifstyle,caption={Emergency governance label chain in \texttt{EmergencyMigratableBase.scif}.}]
 // setEmergencyCaller: committee check then one-step endorsement
-if (sender != _EMERGENCY_COMMITTEE) {
+if (sender != _EMERGENCY_COMMITTEE) {       // guard #1
     throw UnauthorizedCaller();
 }
-// Write-once guard: runtime only, not a label property
-if (_emergencyCaller != address(0)) {
+if (newEmergencyCaller == address(0)) {      // guard #2
+    throw ZeroAddressNotAllowed();
+}
+if (_emergencyCaller != address(0)) {        // guard #3: write-once
     throw EmergencyCallerAlreadySet();
 }
+// guard #4: PA must be stopped (external call to PA)
+IProtocolAdapterEmergencyCheck pa = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER);
+if (!pa.isEmergencyStopped()) { throw ProtocolAdapterNotStopped(); }
+
 // SINGLE TRUST ESCALATION: committee -> contract integrity
 address{this} endorsedCaller = endorse(newEmergencyCaller, sender -> this);
 _emergencyCaller = endorsedCaller;
 \end{lstlisting}
 
 \begin{lstlisting}[style=scifstyle,caption={Fund drain path: emergency caller with unrestricted input.}]
-// forwardEmergencyCall: caller check then unconditional drain
-if (sender != _emergencyCaller) { throw UnauthorizedCaller(); }
+// forwardEmergencyCall: all four guards, then unconditional drain
+if (_emergencyCaller == address(0)) { throw EmergencyCallerNotSet(); }  // #5
+if (sender != _emergencyCaller) { throw UnauthorizedCaller(); }         // #6
+// guard #7: PA must still be stopped
+IProtocolAdapterEmergencyCheck pa = IProtocolAdapterEmergencyCheck(_PROTOCOL_ADAPTER);
+if (!pa.isEmergencyStopped()) { throw ProtocolAdapterNotStopped(); }
+
 bytes{this} endorsedInput = endorse(input, sender -> this);
-lock(this) {
+lock(this) {                                                            // #8
     atomic {
-        result = _forwardEmergencyCallInternal(endorsedInput); // arbitrary token op
+        result = _forwardEmergencyCallInternal(endorsedInput);
     } rescue * { ... }
 }
 \end{lstlisting}
 
-The endorsement chain is:
+In the SCIF model, the entire emergency path reduces to two
+\texttt{endorse} calls with no intermediate endorser:
+
 \[
   \underbrace{\texttt{\_EMERGENCY\_COMMITTEE}}_{\{this\}}
-  \xrightarrow{\texttt{setEmergencyCaller}}
+  \xrightarrow[\text{1 endorsement}]{\texttt{setEmergencyCaller}}
   \underbrace{\texttt{\_emergencyCaller}}_{\{this\}}
-  \xrightarrow{\texttt{forwardEmergencyCall}}
+  \xrightarrow[\text{1 endorsement}]{\texttt{forwardEmergencyCall}}
   \text{drain all tokens}
 \]
-There is no intermediate endorser, no time-lock, no second principal. In
-Solidity this structure is present but implicit. In SCIF the single-step
-escalation is inescapably visible in the endorsement annotation.
+
+A time-lock would appear as a third node in this chain (a pending
+state that must mature before the second endorsement becomes valid).
+A multi-party gate would appear as a second endorser principal.
+Neither exists in the current model.
 
 \begin{figure}[h]
 \centering
@@ -1422,8 +1470,10 @@ This makes the SCIF model accurately reflect the Solidity.
 
 \subsection{What SCIF Catches That Traditional Tools Miss}
 
-Slither detects reentrancy patterns, integer overflow, and common anti-patterns.
-Mythril performs symbolic execution over bounded paths. Neither tool produces an
+Slither~\cite{slither} detects reentrancy patterns, integer overflow, and
+common anti-patterns.
+Mythril~\cite{mythril} performs symbolic execution over bounded paths.
+Neither tool produces an
 enumeration of \emph{trust promotions}. A Slither run on \texttt{ProtocolAdapter.sol}
 flags the \texttt{calls-loop} pattern (external calls inside a loop) with a
 note that it is expected. It does not identify which fields in \texttt{callBlob}
@@ -1715,6 +1765,25 @@ Three extensions would materially strengthen the IFC analysis:
   November 2022.
   \url{https://blog.uniswap.org/permit2-and-universal-router}
 
+\bibitem{slither}
+  J.~Feist, G.~Grieco, and A.~Groce,
+  ``Slither: A Static Analysis Framework for Smart Contracts,''
+  in \emph{Proceedings of the 2nd International Workshop on Emerging Trends
+  in Software Engineering for Blockchain (WETSEB)}, 2019, pp.~8--15.
+  DOI: \url{https://doi.org/10.1109/WETSEB.2019.00008}.
+  Tool: \url{https://github.com/crytic/slither}
+
+\bibitem{mythril}
+  ConsenSys Diligence,
+  ``Mythril: symbolic-execution-based security analysis tool for EVM
+  bytecode.''
+  \url{https://github.com/ConsenSysDiligence/mythril}
+
+\bibitem{halmos}
+  a16z Crypto,
+  ``Halmos: a symbolic testing tool for EVM smart contracts.''
+  \url{https://github.com/a16z/halmos}
+
 \bibitem{eip1153}
   A.~Akhunov and M.~Salem,
   ``EIP-1153: Transient storage opcodes,''
@@ -1722,5 +1791,134 @@ Three extensions would materially strengthen the IFC analysis:
   \url{https://eips.ethereum.org/EIPS/eip-1153}
 
 \end{thebibliography}
+
+%% ============================================================
+\appendix
+%% ============================================================
+
+\section{Reproducibility}
+\label{app:reproducibility}
+
+This appendix explains how to clone the artefact repository, set up the
+SCIF compiler, and reproduce every typecheck and compilation reported in
+this document.
+
+\subsection{Repository Layout}
+
+\begin{verbatim}
+information-flow-smart-contracts/
+├── pa/                          SCIF model: Protocol Adapter
+├── forwarder/                   SCIF models: ForwarderBase, ERC20Forwarder,
+│                                  EmergencyMigratableBase, ERC20ForwarderV3
+├── combined/                    SCIF model: cross-contract CDA trace
+├── interfaces/                  SCIF interfaces: IForwarder, IERC20
+├── findings/                    audit report, per-phase notes, evaluation
+├── doc/                         this LaTeX report
+├── third_party/
+│   ├── pa-evm/                  git submodule -> anoma/pa-evm
+│   └── anomapay-erc20-forwarder/  git submodule -> anoma/anomapay-erc20-forwarder
+├── .github/workflows/           CI: typecheck + compile + PDF build
+└── justfile                     local build recipes
+\end{verbatim}
+
+\subsection{Clone and Initialise}
+
+\begin{verbatim}
+# Clone with submodules (fetches the Anoma contract sources)
+git clone --recurse-submodules \
+    https://github.com/jonaprieto/information-flow-smart-contracts.git
+cd information-flow-smart-contracts
+
+# If you already cloned without --recurse-submodules:
+just init
+\end{verbatim}
+
+After this step, the original Solidity contracts are available under
+\texttt{third\_party/pa-evm/contracts/src/} and
+\texttt{third\_party/anomapay-erc20-forwarder/contracts/src/}.
+
+\subsection{Install the SCIF Compiler}
+
+The SCIF compiler requires Java~21. We recommend the Temurin distribution.
+
+\begin{verbatim}
+# macOS
+brew install --cask temurin@21
+
+# Ubuntu / Debian
+sudo apt-get install temurin-21-jdk
+\end{verbatim}
+
+Clone the SCIF compiler and build it (one-off, takes about 30\,s):
+
+\begin{verbatim}
+# Clone next to this repo, pinned to the stable release
+git clone --branch latest --recurse-submodules \
+    https://github.com/apl-cornell/SCIF.git ../forks/SCIF
+
+# Build
+cd ../forks/SCIF && ./gradlew build -x test && cd -
+\end{verbatim}
+
+The \texttt{SCIF\_DIR} environment variable overrides the default path.
+If you place the compiler elsewhere:
+
+\begin{verbatim}
+export SCIF_DIR=/path/to/your/SCIF
+\end{verbatim}
+
+\subsection{Typecheck and Compile}
+
+Install the \texttt{just} command runner if you don't have it:
+
+\begin{verbatim}
+# macOS
+brew install just
+
+# Linux
+curl --proto '=https' -sSf https://just.systems/install.sh | bash
+\end{verbatim}
+
+Then:
+
+\begin{verbatim}
+just check            # verify Java + SCIF are reachable
+just typecheck-all    # IFC typecheck every .scif file
+just compile-all      # compile every .scif to Solidity (under tmp/)
+\end{verbatim}
+
+To work with individual files:
+
+\begin{verbatim}
+just typecheck pa/ProtocolAdapterCore.scif
+just compile   forwarder/ForwarderBase.scif
+\end{verbatim}
+
+\subsection{Browsing the Original Solidity}
+
+After \texttt{just init}, the vendored contract sources are at:
+
+\begin{verbatim}
+# Protocol Adapter
+third_party/pa-evm/contracts/src/ProtocolAdapter.sol
+
+# ERC20 Forwarder
+third_party/anomapay-erc20-forwarder/contracts/src/ERC20Forwarder.sol
+third_party/anomapay-erc20-forwarder/contracts/src/bases/ForwarderBase.sol
+third_party/anomapay-erc20-forwarder/contracts/src/bases/EmergencyMigratableForwarderBase.sol
+third_party/anomapay-erc20-forwarder/contracts/src/drafts/ERC20ForwarderV3.sol
+\end{verbatim}
+
+To update the vendored sources to the latest upstream \texttt{main}:
+
+\begin{verbatim}
+just update-contracts
+\end{verbatim}
+
+To list all vendored Solidity files:
+
+\begin{verbatim}
+just show-contracts
+\end{verbatim}
 
 \end{document}
