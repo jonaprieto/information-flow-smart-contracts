@@ -77,11 +77,15 @@ import "../interfaces/IForwarder.scif";
 
 // RISC Zero verifier router — the ZK oracle.
 // verify() reverts if the proof is invalid.
-interface IRiscZeroVerifier {
+// getVerifier(selector) returns the address of the specific verifier
+// contract for a given selector (the PA is bound to one selector).
+interface IRiscZeroVerifierRouter {
     @public void verify(bytes seal, uint imageId, uint journalDigest);
+    @public address getVerifier(uint selector);
 }
 
-// Pausable check — used to query whether the verifier is paused.
+// Pausable check — used to query whether a specific verifier is paused.
+// In Solidity: Pausable(verifierRouter.getVerifier(selector)).paused()
 interface IPausableCheck {
     @public bool paused();
 }
@@ -95,6 +99,7 @@ contract ProtocolAdapterFull {
     // --- Immutable configuration (deployer-endorsed) ---
 
     address{this} _riscZeroVerifierRouter;
+    uint{this} _riscZeroVerifierSelector;
     address{this} _owner;
 
     // --- Commitment tree state ---
@@ -129,8 +134,9 @@ contract ProtocolAdapterFull {
     //   1. _riscZeroVerifierRouter: deployer sets the trusted verifier
     //   2. _owner: deployer sets who can emergency-stop
 
-    constructor(address riscZeroVerifierRouter, address owner) {
+    constructor(address riscZeroVerifierRouter, uint riscZeroVerifierSelector, address owner) {
         _riscZeroVerifierRouter = endorse(riscZeroVerifierRouter, sender -> this);
+        _riscZeroVerifierSelector = endorse(riscZeroVerifierSelector, sender -> this);
         _owner = endorse(owner, sender -> this);
         _paused = false;
         _commitmentCount = 0;
@@ -464,25 +470,29 @@ contract ProtocolAdapterFull {
     // verifier is paused. The real contract checks both:
     //   Pausable(verifierRouter.getVerifier(selector)).paused() || paused()
     //
-    // The SCIF model queries the verifier via IPausableCheck. If the
-    // verifier address is unreachable or reverts, the atomic/rescue
-    // block treats it as "not paused" (conservative default).
+    // SECURITY NOTE (missed finding from audit):
+    // This means a THIRD PARTY (whoever controls the RISC Zero verifier
+    // governance) can trigger the emergency-stopped state without the
+    // protocol's own emergencyStop() being called. This opens the CRIT-1
+    // drain window through an external trigger the protocol does not
+    // control. The trust chain is:
+    //   verifier governance → verifier.pause() → isEmergencyStopped() = true
+    //   → committee can call setEmergencyCaller → drain
 
     @public
     bool isEmergencyStopped() {
         if (_paused) {
             result = true;
         } else {
-            // Check if the RISC Zero verifier has been paused.
-            // This is an external call to a trusted address.
-            IPausableCheck verifier = IPausableCheck(_riscZeroVerifierRouter);
-            bool verifierPaused = false;
-            atomic {
-                verifierPaused = verifier.paused();
-            } rescue * {
-                // If the verifier is unreachable, assume not paused.
-                verifierPaused = false;
-            }
+            // Two-step: first get the specific verifier from the router,
+            // then check if that verifier is paused.
+            // This matches Solidity:
+            //   Pausable(address(_TRUSTED_RISC_ZERO_VERIFIER_ROUTER
+            //     .getVerifier(getRiscZeroVerifierSelector()))).paused()
+            IRiscZeroVerifierRouter router = IRiscZeroVerifierRouter(_riscZeroVerifierRouter);
+            address verifierAddr = router.getVerifier(_riscZeroVerifierSelector);
+            IPausableCheck verifier = IPausableCheck(verifierAddr);
+            bool verifierPaused = verifier.paused();
             result = verifierPaused;
         }
     }

@@ -72,6 +72,11 @@ interface ICommitmentTreeReader {
     @public uint latestCommitmentTreeRoot();
 }
 
+// Used to read the logic reference from a forwarder contract.
+interface ILogicRefReader {
+    @public uint getLogicRef();
+}
+
 // Interface for calling forwardEmergencyCall on a previous forwarder.
 interface IEmergencyForwarder {
     @public bytes forwardEmergencyCall(bytes input);
@@ -230,12 +235,16 @@ contract ERC20ForwarderV2Core {
         }
 
         // Interact: call V1 forwarder to pull tokens into V2.
-        // LABEL NOTE: _ERC20_FORWARDER_V1 has {this} integrity.
-        // The call result is discarded (we only care about the token transfer).
+        // Real Solidity encodes: abi.encode(CallType.Unwrap, token, amount,
+        //   UnwrapData({receiver: address(this)}))
+        // SCIF cannot model abi.encode (GAP-1); we document the actual
+        // payload structure here. The trust flow is: V2 calls V1's
+        // forwardEmergencyCall with {this}-labeled input, V1 unwraps
+        // tokens to V2's address.
         IEmergencyForwarder fwdV1 = IEmergencyForwarder(_ERC20_FORWARDER_V1);
-        bytes{this} callInput = endorse(bytes(0), sender -> this);
+        bytes{this} v1UnwrapPayload = endorse(bytes(amount), sender -> this);
         atomic {
-            fwdV1.forwardEmergencyCall(callInput);
+            fwdV1.forwardEmergencyCall(v1UnwrapPayload);
         } rescue * {
             assert false;
         }
@@ -398,8 +407,11 @@ contract ERC20ForwarderV3Core {
             assert false;
         }
 
-        ICommitmentTreeReader fwdV2LogicReader = ICommitmentTreeReader(_ERC20_FORWARDER_V2);
-        uint logicRefV2 = fwdV2LogicReader.latestCommitmentTreeRoot();
+        // Read V2's logic reference via the correct interface.
+        // (Previously used ICommitmentTreeReader.latestCommitmentTreeRoot,
+        //  which was the wrong method — fixed per audit.)
+        ILogicRefReader fwdV2LR = ILogicRefReader(_ERC20_FORWARDER_V2);
+        uint logicRefV2 = fwdV2LR.getLogicRef();
         _LOGIC_REFERENCE_V2 = endorse(logicRefV2, sender -> this);
     }
 
@@ -457,10 +469,13 @@ contract ERC20ForwarderV3Core {
         }
 
         // Interact: call V2 forwarder to pull tokens into V3.
+        // Real Solidity encodes: abi.encode(CallType.Unwrap, token, amount,
+        //   UnwrapData({receiver: address(this)}))
+        // Same GAP-1 limitation as in _migrateV1.
         IEmergencyForwarder fwdV2 = IEmergencyForwarder(_ERC20_FORWARDER_V2);
-        bytes{this} callInput = endorse(bytes(0), sender -> this);
+        bytes{this} v2UnwrapPayload = endorse(bytes(amount), sender -> this);
         atomic {
-            fwdV2.forwardEmergencyCall(callInput);
+            fwdV2.forwardEmergencyCall(v2UnwrapPayload);
         } rescue * {
             assert false;
         }

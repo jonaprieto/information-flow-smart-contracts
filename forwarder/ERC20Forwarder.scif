@@ -250,8 +250,11 @@ contract ERC20Forwarder {
             }
         }
 
-        // Return empty bytes (Solidity: output = "")
-        result = signature;  // placeholder — SCIF requires a result of type bytes{this}
+        // Return empty bytes (Solidity: output = "").
+        // SCIF has no empty-bytes literal with {this} label, so we
+        // endorse a zero placeholder. This is a modeling workaround only.
+        bytes{this} emptyOutput = endorse(bytes(0), sender -> this);
+        result = emptyOutput;
     }
 
     // ============================================================

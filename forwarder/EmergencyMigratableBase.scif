@@ -214,12 +214,12 @@ contract EmergencyMigratableBase {
         // lock(this): reentrancy guard.
         // SCIF ensures that within this block, the PC label stays {this}
         // and that recursive re-entry via _forwardEmergencyCall is blocked.
+        //
+        // NOTE: The real Solidity does NOT use try/catch here — if
+        // _forwardEmergencyCall reverts, the entire transaction reverts.
+        // We use lock(this) without atomic/rescue to match this behavior.
         lock(this) {
-            atomic {
-                result = _forwardEmergencyCallInternal(endorsedInput);
-            } rescue * {
-                result = endorsedInput;
-            }
+            result = _forwardEmergencyCallInternal(endorsedInput);
         }
     }
 

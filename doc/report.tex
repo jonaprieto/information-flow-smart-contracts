@@ -226,19 +226,22 @@ compiles to Solidity and enforces integrity properties via the Decentralized
 Label Model, preventing confused deputy attacks (CDAs), reentrancy violations,
 and improper exception handling at the type level.
 
-Six SCIF models were written covering the two contracts and their interactions.
-The models surface \textbf{16 explicit endorsement sites} whose soundness
-depends entirely on ZK circuit coverage --- a finding that is invisible to
-conventional static analysis but becomes an enumerable audit checklist under
-SCIF. Three findings of high or critical severity were identified: an emergency
-committee architecture with no on-chain time-lock or multi-party gate that
-permits single-actor fund drain (CRIT-1); the full CDA exposure introduced by
+Seven SCIF models were written covering the two contracts and their
+interactions. The models surface \textbf{16 explicit endorsement sites}
+whose soundness depends entirely on ZK circuit coverage --- a finding that
+is invisible to conventional static analysis but becomes an enumerable audit
+checklist under SCIF. Four findings of high or critical severity were
+identified: the 16 ZK-circuit-dependent endorsement sites that form a
+mandatory circuit-review checklist (HIGH-1); an emergency committee
+architecture with no on-chain time-lock or multi-party gate that permits
+single-actor fund drain (CRIT-1); the full CDA exposure introduced by
 PA's user-controlled forwarder dispatch (HIGH-2); and a constructor-level
 copy-paste error in \textsf{ERC20ForwarderV3} at line 77 that permanently
-prevents migration of all V2 resources (HIGH). Three medium-severity and four
-model gap findings complete the report. We discuss what SCIF catches that
-conventional auditing tools miss, what it cannot catch, and the pitfalls that
-arise when applying IFC to ZK-backed smart contracts.
+prevents migration of all V2 resources (HIGH). One medium-severity finding
+(balance-invariant lock scope) and four model-gap findings complete the
+report. We discuss what SCIF catches that conventional auditing tools miss,
+what it cannot catch, and the pitfalls that arise when applying IFC to
+ZK-backed smart contracts.
 
 \end{abstract}
 
@@ -861,16 +864,17 @@ and dynamic call counts as compiled by the SCIF type-checker.
 \small
 \begin{tabular}{@{}lrrl@{}}
 \toprule
-\textbf{Model file} & \textbf{Endorsements} & \textbf{Dyn.\ calls} & \textbf{Notes} \\
+\textbf{Model file} & \textbf{Endorse} & \textbf{Dyn.} & \textbf{Notes} \\
 \midrule
 \texttt{ForwarderBase.scif}           & 4  & 4  & Base access-control pattern \\
-\texttt{ProtocolAdapterCore.scif}     & 9  & 6  & ZK oracle; 6 post-proof endorsements \\
+\texttt{ProtocolAdapterCore.scif}     & 9  & 6  & Minimal PA; 6 post-proof sites \\
+\texttt{ProtocolAdapterFull.scif}     & 18 & 6  & Full PA: compliance, state mgmt \\
 \texttt{PaAndForwarder.scif}          & 10 & 6  & Cross-contract CDA trace \\
-\texttt{ERC20Forwarder.scif}          & 13 & 6  & 10 wrap/unwrap param endorsements \\
-\texttt{EmergencyMigratableBase.scif} & 5  & 10 & Committee governance chain \\
-\texttt{ERC20ForwarderV3.scif}        & 14 & 12 & V3 bug visible in endorsement \\
+\texttt{ERC20Forwarder.scif}          & 14 & 6  & 10 wrap/unwrap param sites \\
+\texttt{EmergencyMigratableBase.scif} & 6  & 10 & Committee governance chain \\
+\texttt{ERC20ForwarderV3.scif}        & 33 & 12 & V2+V3 migration + V3 bug \\
 \midrule
-\textbf{Total}                        & \textbf{55} & \textbf{44} & 16 post-oracle sites \\
+\textbf{Total (unique models)}        & \textbf{94} & \textbf{50} & 16 post-oracle sites \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1081,6 +1085,27 @@ and the first permitted \texttt{forwardEmergencyCall} invocation (e.g., a
 block-number-based delay stored at \texttt{setEmergencyCaller} time). A second
 endorser in the SCIF model would represent a multi-sig threshold requirement.
 
+\paragraph{Related: third-party trigger via verifier pause.}
+\texttt{isEmergencyStopped()} (\parefR{ProtocolAdapter.sol}{133}{138})
+returns \texttt{true} when \emph{either} the PA is paused \emph{or} the
+RISC Zero verifier (a separate contract governed by a separate party) is
+paused. This means the drain window can be opened by the verifier
+governance pausing the verifier --- an action the protocol team does not
+control. The trust chain becomes:
+\[
+  \text{verifier governance}
+  \xrightarrow{\texttt{pause()}}
+  \texttt{isEmergencyStopped} = \text{true}
+  \xrightarrow{\text{CRIT-1 chain}}
+  \text{drain}
+\]
+This additional trigger does not change the on-chain mechanics (the same
+eight guards in \cref{tab:emergency-guards} still apply), but it means
+the prerequisite ``PA must be stopped'' can be satisfied by an external
+actor. If the verifier governance is less secured than the protocol's own
+emergency committee, this path may have a lower effective security
+threshold than the protocol team expects.
+
 \subsection{HIGH-1: ZK Circuit Gaps Make All 16 PA Endorsements Unsound by Default}
 \label{sec:high1}
 
@@ -1103,7 +1128,7 @@ bytes{this}   eInput      = endorse(forwarderInput,sender -> this);
 bytes{this}   eExpected   = endorse(expectedOutput,sender -> this);
 \end{lstlisting}
 
-\begin{lstlisting}[style=scifstyle,caption={Ten post-access-check endorsements in \texttt{ERC20Forwarder.scif:147--156}.}]
+\begin{lstlisting}[style=scifstyle,caption={Ten post-access-check endorsements in \texttt{ERC20Forwarder.scif:149--158}.}]
 // After sender == _PROTOCOL_ADAPTER check:
 uint{this}    eCallType = endorse(callType,   sender -> this);
 address{this} eToken    = endorse(token,      sender -> this);
@@ -1257,7 +1282,7 @@ function _executeForwarderCall(
 
 \paragraph{How SCIF surfaces this.}
 The combined model \texttt{PaAndForwarder.scif} makes the full call chain
-appear in a single file. The comment at line 109 of \texttt{ProtocolAdapterCore.scif}
+appear in a single file. The comment at line 117 of \texttt{ProtocolAdapterCore.scif}
 reads: ``CDA risk: if the ZK circuit allows the user to specify a malicious
 forwarder address, the PA would call it with full PA authority.'' SCIF requires
 the developer to write this trust boundary as an \texttt{endorse} call; the
@@ -1322,7 +1347,7 @@ normal \texttt{\_migrateV2} path and require the emergency caller path
 
 \paragraph{How SCIF makes the bug visible.}
 SCIF forces the developer to write an explicit endorsement with a named source
-variable. The buggy SCIF constructor at \texttt{ERC20ForwarderV3.scif:369--373}
+variable. The buggy SCIF constructor at \texttt{ERC20ForwarderV3.scif:388--392}
 reads:
 
 \begin{lstlisting}[style=scifstyle,caption={The V3 bug made reviewer-visible in the SCIF model.},firstnumber=369]
@@ -1442,7 +1467,7 @@ as a single void call in \texttt{ERC20Forwarder.scif}.
 
 \subsubsection{GAP-3: V3 Emergency Dispatch Absent from SCIF Model}
 
-\texttt{ERC20ForwarderV3.scif:492--518} shows \texttt{forwardEmergencyCall}
+\texttt{ERC20ForwarderV3.scif:517--545} shows \texttt{forwardEmergencyCall}
 returning \texttt{endorsedInput} directly without dispatching to migration logic.
 The real V3 contract dispatches to \texttt{\_migrateV1}, \texttt{\_migrateV2},
 or token transfer logic. The SCIF model cannot reason about information flow
