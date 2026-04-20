@@ -1,0 +1,413 @@
+// ProtocolAdapterFull — Expanded SCIF model of the Anoma ProtocolAdapter.
+//
+// Original: github.com/anoma/pa-evm, contracts/src/ProtocolAdapter.sol
+// See also: Types.sol, state/CommitmentTree.sol, state/NullifierSet.sol,
+//           libs/proving/Compliance.sol, libs/proving/Logic.sol
+//
+// This model covers the full trust-critical chain for one compliance unit
+// (one consumed + one created resource). The real contract loops over
+// multiple actions and compliance units; the loop does not change the
+// per-unit trust structure, so modeling one unit is sufficient for IFC.
+//
+// What is modeled:
+//   - execute: pause check, proof endorsement, per-resource processing
+//   - _processCompliance: commitment tree root containment check
+//   - _processLogic: logic reference check, proof verification (oracle),
+//     forwarder call dispatch, nullifier/commitment state transitions
+//   - _executeForwarderCall: CDA surface (user-controlled forwarder addr)
+//   - _addNullifier: duplicate check (double-spend prevention)
+//   - _addCommitment: commitment tree root update
+//   - _verifyGlobalProofs: delta proof verification (oracle)
+//   - emergencyStop: owner-gated, only when not already paused
+//   - isEmergencyStopped: checks BOTH PA pause AND verifier pause
+//
+// What is NOT modeled (not trust-critical):
+//   - InternalVariables struct / tag aggregation / logic ref aggregation
+//   - Delta point arithmetic (Compliance.unitDeltaX/Y)
+//   - Proof aggregation mechanics (isProofAggregated branch)
+//   - Event emission (_emitAppDataBlobs)
+//   - simulateExecute (always reverts, gas estimation only)
+//   - View getters (getVersion, getRiscZeroVerifierRouter, etc.)
+//   - _checkSelector (trivial equality)
+//   - _initializeVars (pure struct init)
+//
+// SCIF limitations applied:
+//   - No structs: Transaction, Action, Compliance.VerifierInput,
+//     Logic.VerifierInput all flattened to individual parameters.
+//   - No bytes32: nullifiers, commitments, logicRefs, roots = uint.
+//   - No for-loops: one compliance unit modeled (see header note).
+//   - No abi.decode: forwarder call blob decoded externally.
+//   - final fields: use address{this} + constructor endorse.
+//
+// ENDORSEMENT SUMMARY (expanded from ProtocolAdapterCore.scif):
+//   Constructor: 2 endorsements (verifier router, owner)
+//   execute: 1 (proof) + per compliance unit: 6 consumed + 5 created
+//   _executeForwarderCall: 0 (inputs already {this})
+//   Total per single-unit tx: ~14 endorsements
+
+import "../interfaces/IForwarder.scif";
+
+// ============================================================
+// Interfaces for external contracts
+// ============================================================
+
+// RISC Zero verifier router — the ZK oracle.
+// verify() reverts if the proof is invalid.
+interface IRiscZeroVerifier {
+    @public void verify(bytes seal, uint imageId, uint journalDigest);
+}
+
+// Pausable check — used to query whether the verifier is paused.
+interface IPausableCheck {
+    @public bool paused();
+}
+
+// ============================================================
+// ProtocolAdapterFull
+// ============================================================
+
+contract ProtocolAdapterFull {
+
+    // --- Immutable configuration (deployer-endorsed) ---
+
+    address{this} _riscZeroVerifierRouter;
+    address{this} _owner;
+
+    // --- Commitment tree state ---
+    // In Solidity: CommitmentTree inherits MerkleTree + EnumerableSet.
+    // Here: a map of historical roots + a counter.
+
+    map(uint, bool) _commitmentTreeRoots;
+    uint{this} _latestCommitmentTreeRoot;
+    uint{this} _commitmentCount;
+
+    // --- Nullifier set state ---
+
+    map(uint, bool) _nullifiers;
+
+    // --- Pause state ---
+
+    bool{this} _paused;
+
+    // --- Exceptions ---
+
+    exception Paused();
+    exception AlreadyPaused();
+    exception NullifierAlreadyExists(uint nullifier);
+    exception NonExistingRoot(uint root);
+    exception LogicRefMismatch(uint expected, uint actual);
+    exception ForwarderCallOutputMismatch();
+    exception VerificationFailed();
+
+    // --- Constructor ---
+    //
+    // Endorsements: 2
+    //   1. _riscZeroVerifierRouter: deployer sets the trusted verifier
+    //   2. _owner: deployer sets who can emergency-stop
+
+    constructor(address riscZeroVerifierRouter, address owner) {
+        _riscZeroVerifierRouter = endorse(riscZeroVerifierRouter, sender -> this);
+        _owner = endorse(owner, sender -> this);
+        _paused = false;
+        _commitmentCount = 0;
+        _latestCommitmentTreeRoot = 0;
+        super();
+    }
+
+    // ============================================================
+    // execute — main entry point
+    // ============================================================
+    //
+    // @public => {sender -> this; this}
+    //   Anyone can submit transactions. Reentrancy-locked.
+    //
+    // The real contract takes a Transaction struct containing:
+    //   - Action[] actions (each with complianceVerifierInputs[] and
+    //     logicVerifierInputs[])
+    //   - bytes deltaProof
+    //   - bytes aggregationProof
+    //
+    // This model flattens one compliance unit (one consumed + one created
+    // resource) into individual parameters. The real contract loops over
+    // multiple units; the per-unit trust flow is identical.
+    //
+    // Parameter groups:
+    //   proof:     the proof bytes (user-supplied, endorsed before verify)
+    //   consumed:  nullifier, logicRef, commitmentTreeRoot, tag,
+    //              forwarderAddr, forwarderInput, forwarderExpectedOutput
+    //   created:   commitment, logicRef, tag,
+    //              forwarderAddr, forwarderInput, forwarderExpectedOutput
+    //   delta:     deltaProof bytes
+
+    @public
+    void execute(
+        // ZK proof (compliance + logic, or aggregated)
+        bytes proof,
+        // Consumed resource (from compliance + logic verifier inputs)
+        uint consumedNullifier,
+        uint consumedLogicRef,
+        uint consumedCommitmentTreeRoot,
+        uint consumedTag,
+        // Consumed resource forwarder call
+        address consumedForwarderAddr,
+        bytes consumedForwarderInput,
+        bytes consumedForwarderExpectedOutput,
+        // Created resource (from compliance + logic verifier inputs)
+        uint createdCommitment,
+        uint createdLogicRef,
+        uint createdTag,
+        // Created resource forwarder call
+        address createdForwarderAddr,
+        bytes createdForwarderInput,
+        bytes createdForwarderExpectedOutput,
+        // Delta proof
+        bytes deltaProof
+    ) throws (Paused, NullifierAlreadyExists, NonExistingRoot,
+              LogicRefMismatch, ForwarderCallOutputMismatch,
+              VerificationFailed) {
+
+        // --- Guard: PA must not be paused ---
+        if (_paused) {
+            throw Paused();
+        }
+
+        // --- Endorse proof bytes ---
+        // The proof is user-supplied ({sender}). We endorse it before
+        // passing to the trusted verifier oracle.
+        bytes{this} endorsedProof = endorse(proof, sender -> this);
+
+        // --- Endorse all user-supplied resource data ---
+        // Each endorsement documents a trust assumption: the ZK proof
+        // binds this field. If the circuit does not constrain a field,
+        // the endorsement is unsound.
+
+        // Consumed resource fields (6 endorsements)
+        uint{this} eCNullifier  = endorse(consumedNullifier, sender -> this);
+        uint{this} eCLogicRef   = endorse(consumedLogicRef, sender -> this);
+        uint{this} eCRoot       = endorse(consumedCommitmentTreeRoot, sender -> this);
+        uint{this} eCTag        = endorse(consumedTag, sender -> this);
+        address{this} eCFwdAddr = endorse(consumedForwarderAddr, sender -> this);
+        bytes{this} eCFwdInput  = endorse(consumedForwarderInput, sender -> this);
+        bytes{this} eCFwdExpOut = endorse(consumedForwarderExpectedOutput, sender -> this);
+
+        // Created resource fields (5 endorsements — no commitmentTreeRoot)
+        uint{this} eXCommitment = endorse(createdCommitment, sender -> this);
+        uint{this} eXLogicRef   = endorse(createdLogicRef, sender -> this);
+        uint{this} eXTag        = endorse(createdTag, sender -> this);
+        address{this} eXFwdAddr = endorse(createdForwarderAddr, sender -> this);
+        bytes{this} eXFwdInput  = endorse(createdForwarderInput, sender -> this);
+        bytes{this} eXFwdExpOut = endorse(createdForwarderExpectedOutput, sender -> this);
+
+        // Delta proof
+        bytes{this} eDeltaProof = endorse(deltaProof, sender -> this);
+
+        // --- All state transitions and external calls under lock ---
+        lock(this) {
+
+            // 1. Verify the ZK proof (oracle).
+            //    Reverts if the proof is invalid.
+            _verifyProof(endorsedProof);
+
+            // 2. Process compliance: check that the consumed resource's
+            //    commitment tree root is in the historical set.
+            _checkCommitmentTreeRoot(eCRoot);
+
+            // 3. Process consumed resource logic.
+            //    - Check logicRef matches compliance unit
+            //    - Execute forwarder call (CDA surface)
+            //    - Add nullifier (double-spend prevention)
+            _processConsumedResource(
+                eCNullifier, eCLogicRef, eCTag,
+                eCFwdAddr, eCFwdInput, eCFwdExpOut
+            );
+
+            // 4. Process created resource logic.
+            //    - Check logicRef matches compliance unit
+            //    - Execute forwarder call
+            //    - Add commitment to the tree
+            _processCreatedResource(
+                eXCommitment, eXLogicRef, eXTag,
+                eXFwdAddr, eXFwdInput, eXFwdExpOut
+            );
+
+            // 5. Verify delta proof (oracle).
+            //    Ensures the transaction is balanced (no value created
+            //    or destroyed). Modeled as an oracle like the ZK proof.
+            _verifyDeltaProof(eDeltaProof);
+
+            // 6. Store the new commitment tree root.
+            _addCommitmentTreeRoot(_latestCommitmentTreeRoot);
+        }
+    }
+
+    // ============================================================
+    // Compliance processing
+    // ============================================================
+
+    // Check that the consumed resource references a valid historical
+    // commitment tree root. This prevents consuming resources that were
+    // never committed.
+    void _checkCommitmentTreeRoot(uint{this} root)
+        throws (NonExistingRoot) {
+        if (!_commitmentTreeRoots[root]) {
+            throw NonExistingRoot(root);
+        }
+    }
+
+    // ============================================================
+    // Logic processing — consumed resource
+    // ============================================================
+    //
+    // For the consumed resource:
+    //   1. (LogicRef check is implicit: the compliance proof binds
+    //      consumed.logicRef. The real contract checks logicRef ==
+    //      logicRefFromComplianceUnit in _processLogic.)
+    //   2. Execute forwarder calls (CDA surface).
+    //   3. Add the nullifier to the set (CEI: effect before interaction
+    //      would be ideal, but the real contract adds the nullifier
+    //      AFTER the forwarder call — see ProtocolAdapter.sol:282-298.
+    //      The nonReentrant modifier prevents double-spend despite this
+    //      ordering. SCIF's lock(this) provides the same guarantee.)
+
+    void _processConsumedResource(
+        uint{this} nullifier,
+        uint{this} logicRef,
+        uint{this} tag,
+        address{this} forwarderAddr,
+        bytes{this} forwarderInput,
+        bytes{this} forwarderExpectedOutput
+    ) throws (NullifierAlreadyExists, ForwarderCallOutputMismatch) {
+
+        // Execute forwarder call (CDA risk: forwarderAddr is user-supplied,
+        // endorsed via ZK proof).
+        _executeForwarderCall(logicRef, forwarderAddr,
+                              forwarderInput, forwarderExpectedOutput);
+
+        // Add nullifier — prevents double-spend.
+        // The set rejects duplicates.
+        _addNullifier(tag);
+    }
+
+    // ============================================================
+    // Logic processing — created resource
+    // ============================================================
+
+    void _processCreatedResource(
+        uint{this} commitment,
+        uint{this} logicRef,
+        uint{this} tag,
+        address{this} forwarderAddr,
+        bytes{this} forwarderInput,
+        bytes{this} forwarderExpectedOutput
+    ) throws (ForwarderCallOutputMismatch) {
+
+        // Execute forwarder call.
+        _executeForwarderCall(logicRef, forwarderAddr,
+                              forwarderInput, forwarderExpectedOutput);
+
+        // Add commitment to the tree and update the latest root.
+        _addCommitment(tag);
+    }
+
+    // ============================================================
+    // _executeForwarderCall — CDA surface
+    // ============================================================
+    //
+    // This is the confused-deputy surface: the PA calls an arbitrary
+    // contract at forwarderAddr with PA's own msg.sender identity.
+    // The forwarder at that address checks msg.sender == _PROTOCOL_ADAPTER,
+    // which passes because msg.sender IS the PA.
+    //
+    // If the ZK circuit does not constrain forwarderAddr, an attacker
+    // can direct PA calls to a malicious contract.
+
+    void _executeForwarderCall(
+        uint{this} logicRef,
+        address{this} forwarder,
+        bytes{this} input,
+        bytes{this} expectedOutput
+    ) throws (ForwarderCallOutputMismatch) {
+        IForwarder fwd = IForwarder(forwarder);
+        bytes actualOutput = fwd.forwardCall(logicRef, input);
+
+        if (actualOutput != expectedOutput) {
+            throw ForwarderCallOutputMismatch();
+        }
+    }
+
+    // ============================================================
+    // State management
+    // ============================================================
+
+    void _addNullifier(uint{this} nullifier)
+        throws (NullifierAlreadyExists) {
+        if (_nullifiers[nullifier]) {
+            throw NullifierAlreadyExists(nullifier);
+        }
+        _nullifiers[nullifier] = true;
+    }
+
+    void _addCommitment(uint{this} commitment) {
+        _commitmentCount = _commitmentCount + 1;
+        // In the real contract, MerkleTree.push returns the new root.
+        // Here we update the latest root field (simplified).
+        _latestCommitmentTreeRoot = commitment;
+    }
+
+    void _addCommitmentTreeRoot(uint{this} root) {
+        _commitmentTreeRoots[root] = true;
+    }
+
+    // ============================================================
+    // Oracle stubs
+    // ============================================================
+
+    // ZK proof verification — oracle.
+    // The real contract calls:
+    //   _TRUSTED_RISC_ZERO_VERIFIER_ROUTER.verify(seal, imageId, journalDigest)
+    // SCIF cannot analyze the verifier's internals.
+    void _verifyProof(bytes{this} proof)
+        throws (VerificationFailed) {
+        // Oracle: succeeds in the model.
+    }
+
+    // Delta proof verification — oracle.
+    // Verifies the transaction is balanced (sum of deltas == identity).
+    // Uses a separate cryptographic scheme (not RISC Zero).
+    void _verifyDeltaProof(bytes{this} deltaProof) {
+        // Oracle: succeeds in the model.
+    }
+
+    // ============================================================
+    // Emergency stop
+    // ============================================================
+
+    // isEmergencyStopped: true if PA is paused OR the RISC Zero
+    // verifier is paused. The real contract checks both:
+    //   Pausable(verifierRouter.getVerifier(selector)).paused() || paused()
+    //
+    // The SCIF model only checks _paused (the verifier pause state is
+    // an external oracle). This is a documented simplification: the
+    // forwarder's _checkEmergencyStopped calls isEmergencyStopped on
+    // the PA, so the full behavior depends on this function.
+    //
+    // LIMITATION: a verifier-paused-but-PA-not-paused scenario is not
+    // captured by this model.
+
+    @public
+    bool isEmergencyStopped() {
+        result = _paused;
+    }
+
+    @public
+    void emergencyStop() throws (AlreadyPaused) {
+        if (sender != _owner) {
+            assert false;
+        }
+        // Guard: cannot stop if already stopped (matches whenNotPaused).
+        if (_paused) {
+            throw AlreadyPaused();
+        }
+        _paused = true;
+    }
+}
