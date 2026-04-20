@@ -261,9 +261,10 @@ what prevents reentrancy --- roughly 60\% of Solidity functions by count,
 but close to 100\% of the paths that affect fund safety.
 The unmodeled remainder is view getters, gas simulation, event emission,
 and proof-aggregation mechanics, none of which affect trust flow.
-Six SCIF models were produced, covering the PA, the forwarder, the
-emergency migration chain (V1--V3), and the cross-contract call between
-PA and forwarder.
+Seven SCIF models were produced, covering the PA (both a minimal
+endorsement sketch and an expanded compliance/state model), the
+forwarder, the emergency migration chain (V1--V3), and the
+cross-contract call between PA and forwarder.
 
 \paragraph{What we found.}
 \begin{enumerate}
@@ -279,6 +280,10 @@ PA and forwarder.
     who immediately drains all token balances. The contract enforces no
     time-lock or multi-party gate. Today this is mitigated off-chain by
     a multisig, but the contract itself provides no such guarantee.
+    Additionally, \texttt{isEmergencyStopped()} returns true when the
+    RISC Zero verifier is paused --- meaning a third party (verifier
+    governance) can open this drain window without the protocol's own
+    \texttt{emergencyStop()} being called.
 
   \item \textbf{Classic confused-deputy attack surface} (HIGH-2). The PA
     calls a forwarder address decoded from user calldata. If the ZK
