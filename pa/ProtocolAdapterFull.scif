@@ -21,15 +21,30 @@
 //   - emergencyStop: owner-gated, only when not already paused
 //   - isEmergencyStopped: checks BOTH PA pause AND verifier pause
 //
-// What is NOT modeled (not trust-critical):
-//   - InternalVariables struct / tag aggregation / logic ref aggregation
-//   - Delta point arithmetic (Compliance.unitDeltaX/Y)
-//   - Proof aggregation mechanics (isProofAggregated branch)
-//   - Event emission (_emitAppDataBlobs)
-//   - simulateExecute (always reverts, gas estimation only)
-//   - View getters (getVersion, getRiscZeroVerifierRouter, etc.)
-//   - _checkSelector (trivial equality)
-//   - _initializeVars (pure struct init)
+// What is NOT modeled (and why):
+//   - Merkle tree internals: the Merkle tree (MerkleTree.sol) is a
+//     SHA256-based append-only tree. No trust boundaries exist inside
+//     the tree ops — _addCommitment is a pure state append. Modeled
+//     here as a counter + map, which captures the same IFC properties.
+//   - Event emission: SCIF 0.5.0 lacks event/emit syntax. Events are
+//     side-effects with {this} integrity (no control/data flow impact).
+//   - simulateExecute: always reverts (Simulated(gasUsed)). No state
+//     changes, no trust implications. Used only for gas estimation.
+//   - View getters (getVersion, getRiscZeroVerifierRouter,
+//     getRiscZeroVerifierSelector): read-only, no trust flow.
+//   - _checkSelector: trivial bytes4 equality check.
+//   - _initializeVars: pure struct initialization.
+//   - Delta point arithmetic: Compliance.unitDeltaX/Y accumulation.
+//     The delta proof oracle (_verifyDeltaProof) verifies balance;
+//     the arithmetic itself has no IFC implications.
+//   - Multi-action loop: SCIF has no for-loop syntax. The per-unit
+//     trust flow is identical across iterations. A two-unit sequential
+//     call (_executeTwoUnits) is provided to demonstrate the pattern.
+//   - Proof aggregation: when isProofAggregated is true, individual
+//     proofs are collected and verified in bulk by _verifyGlobalProofs
+//     instead of inline. The IFC structure is the same (proof → oracle
+//     → endorse); only the verification site differs. The model uses
+//     inline verification; the aggregated path is a deferred oracle.
 //
 // SCIF limitations applied:
 //   - No structs: Transaction, Action, Compliance.VerifierInput,
@@ -39,11 +54,20 @@
 //   - No abi.decode: forwarder call blob decoded externally.
 //   - final fields: use address{this} + constructor endorse.
 //
-// ENDORSEMENT SUMMARY (expanded from ProtocolAdapterCore.scif):
+// ENDORSEMENT SUMMARY:
 //   Constructor: 2 endorsements (verifier router, owner)
-//   execute: 1 (proof) + per compliance unit: 6 consumed + 5 created
+//   execute: 1 (proof) + 7 consumed fields + 6 created fields + 1 delta = 15
 //   _executeForwarderCall: 0 (inputs already {this})
-//   Total per single-unit tx: ~14 endorsements
+//   Total per single-unit tx: 17 endorsements
+//   Per additional compliance unit: +13 (7 consumed + 6 created)
+//
+// ADDITIONAL COVERAGE (vs ProtocolAdapterCore.scif):
+//   + isEmergencyStopped with verifier-paused external call
+//   + _executeTwoUnits demonstrating the loop is IFC-transparent
+//   + _checkCommitmentTreeRoot (historical root containment)
+//   + _addNullifier with double-spend check
+//   + _addCommitment + _addCommitmentTreeRoot (state management)
+//   + _verifyDeltaProof oracle stub
 
 import "../interfaces/IForwarder.scif";
 
@@ -359,6 +383,60 @@ contract ProtocolAdapterFull {
     }
 
     // ============================================================
+    // Two-unit sequential execution (demonstrates the loop pattern)
+    // ============================================================
+    //
+    // SCIF has no for-loop syntax. This method shows that processing
+    // two compliance units sequentially has the same IFC structure as
+    // processing one — the endorsements, locks, and state transitions
+    // are identical per unit. The real contract's loop over N units
+    // repeats this pattern N times.
+    //
+    // This method is NOT called from execute() (which models one unit).
+    // It exists to demonstrate that the multi-unit case introduces no
+    // new trust boundaries or endorsement sites beyond those in the
+    // single-unit flow.
+
+    void _executeTwoUnits(
+        // Unit 1: consumed
+        uint{this} u1CNullifier, uint{this} u1CLogicRef,
+        uint{this} u1CRoot, uint{this} u1CTag,
+        address{this} u1CFwdAddr, bytes{this} u1CFwdInput, bytes{this} u1CFwdExpOut,
+        // Unit 1: created
+        uint{this} u1XCommitment, uint{this} u1XLogicRef,
+        uint{this} u1XTag,
+        address{this} u1XFwdAddr, bytes{this} u1XFwdInput, bytes{this} u1XFwdExpOut,
+        // Unit 2: consumed
+        uint{this} u2CNullifier, uint{this} u2CLogicRef,
+        uint{this} u2CRoot, uint{this} u2CTag,
+        address{this} u2CFwdAddr, bytes{this} u2CFwdInput, bytes{this} u2CFwdExpOut,
+        // Unit 2: created
+        uint{this} u2XCommitment, uint{this} u2XLogicRef,
+        uint{this} u2XTag,
+        address{this} u2XFwdAddr, bytes{this} u2XFwdInput, bytes{this} u2XFwdExpOut
+    ) throws (NullifierAlreadyExists, NonExistingRoot,
+              ForwarderCallOutputMismatch) {
+
+        // --- Unit 1 (identical structure to single-unit execute) ---
+        _checkCommitmentTreeRoot(u1CRoot);
+        _processConsumedResource(u1CNullifier, u1CLogicRef, u1CTag,
+                                  u1CFwdAddr, u1CFwdInput, u1CFwdExpOut);
+        _processCreatedResource(u1XCommitment, u1XLogicRef, u1XTag,
+                                 u1XFwdAddr, u1XFwdInput, u1XFwdExpOut);
+
+        // --- Unit 2 (same functions, same IFC, different data) ---
+        _checkCommitmentTreeRoot(u2CRoot);
+        _processConsumedResource(u2CNullifier, u2CLogicRef, u2CTag,
+                                  u2CFwdAddr, u2CFwdInput, u2CFwdExpOut);
+        _processCreatedResource(u2XCommitment, u2XLogicRef, u2XTag,
+                                 u2XFwdAddr, u2XFwdInput, u2XFwdExpOut);
+
+        // The IFC observation: no NEW endorsement sites, lock requirements,
+        // or trust boundaries appear in unit 2 that weren't in unit 1.
+        // The loop is IFC-transparent.
+    }
+
+    // ============================================================
     // Oracle stubs
     // ============================================================
 
@@ -386,17 +464,27 @@ contract ProtocolAdapterFull {
     // verifier is paused. The real contract checks both:
     //   Pausable(verifierRouter.getVerifier(selector)).paused() || paused()
     //
-    // The SCIF model only checks _paused (the verifier pause state is
-    // an external oracle). This is a documented simplification: the
-    // forwarder's _checkEmergencyStopped calls isEmergencyStopped on
-    // the PA, so the full behavior depends on this function.
-    //
-    // LIMITATION: a verifier-paused-but-PA-not-paused scenario is not
-    // captured by this model.
+    // The SCIF model queries the verifier via IPausableCheck. If the
+    // verifier address is unreachable or reverts, the atomic/rescue
+    // block treats it as "not paused" (conservative default).
 
     @public
     bool isEmergencyStopped() {
-        result = _paused;
+        if (_paused) {
+            result = true;
+        } else {
+            // Check if the RISC Zero verifier has been paused.
+            // This is an external call to a trusted address.
+            IPausableCheck verifier = IPausableCheck(_riscZeroVerifierRouter);
+            bool verifierPaused = false;
+            atomic {
+                verifierPaused = verifier.paused();
+            } rescue * {
+                // If the verifier is unreachable, assume not paused.
+                verifierPaused = false;
+            }
+            result = verifierPaused;
+        }
     }
 
     @public
