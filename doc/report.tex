@@ -238,6 +238,73 @@ arise when applying IFC to ZK-backed smart contracts.
 
 \end{abstract}
 
+%% ============================================================
+\section*{Executive Summary}
+\addcontentsline{toc}{section}{Executive Summary}
+%% ============================================================
+
+\paragraph{What we did.}
+We rewrote the security-critical core of two Anoma smart contracts ---
+the EVM Protocol Adapter (PA) and the ERC20 Forwarder --- in
+SCIF~\cite{scif2025}, a language that compiles to Solidity and forces
+every trust decision to be written down explicitly. The original
+Solidity is silent about where untrusted user data becomes trusted;
+the SCIF models name every such point. Six models were produced,
+covering the PA, the forwarder, the emergency migration chain (V1--V3),
+and the cross-contract call between PA and forwarder.
+
+\paragraph{What we found.}
+\begin{enumerate}
+  \item \textbf{16 trust assumptions that depend on the ZK circuit}
+    (HIGH-1). The PA endorses 6 user-supplied fields after proof
+    verification; the forwarder endorses 10 more after checking
+    \texttt{msg.sender == PA}. Each endorsement is only valid if the
+    RISC Zero circuit constrains the corresponding field. No existing
+    audit tool produces this list --- SCIF does.
+
+  \item \textbf{Emergency committee can drain funds in two transactions}
+    (CRIT-1). A single committee key can appoint an emergency caller
+    who immediately drains all token balances. The contract enforces no
+    time-lock or multi-party gate. Today this is mitigated off-chain by
+    a multisig, but the contract itself provides no such guarantee.
+
+  \item \textbf{Classic confused-deputy attack surface} (HIGH-2). The PA
+    calls a forwarder address decoded from user calldata. If the ZK
+    circuit does not constrain this address, an attacker can redirect PA
+    calls to a malicious contract. An on-chain allowlist would eliminate
+    this risk independent of the circuit.
+
+  \item \textbf{V3 constructor bug} (HIGH). Line 77 of
+    \texttt{ERC20ForwarderV3.sol} reads the commitment tree root from the
+    wrong Protocol Adapter (V1 instead of V2). This permanently blocks
+    migration of all V2 resources. Requires redeployment to fix.
+\end{enumerate}
+
+\paragraph{What to do next (priority order).}
+\begin{enumerate}
+  \item \textbf{Audit the ZK circuit against the 16-field checklist.}
+    For each endorsed field, confirm it appears as a constrained output
+    in the RISC Zero guest journal. Any missing field means an attacker
+    controls that value despite the on-chain endorsement.
+
+  \item \textbf{Add an on-chain forwarder allowlist} in the PA,
+    independent of the ZK circuit.
+
+  \item \textbf{Redeploy V3} with the corrected root read
+    (\texttt{\_PROTOCOL\_ADAPTER\_V2} instead of \texttt{V1}).
+
+  \item \textbf{Consider adding a time-lock} between
+    \texttt{setEmergencyCaller} and the first
+    \texttt{forwardEmergencyCall}.
+\end{enumerate}
+
+\paragraph{Scope and limitations.}
+This is a \emph{research preview}, not a full audit. SCIF cannot analyze
+the ZK circuit, economic attacks (MEV, sandwiching), gas griefing, or the
+\texttt{abi.decode} step. The analysis complements --- not replaces --- the
+existing Nethermind and Informal Systems audits. See
+\cref{sec:gaps,sec:discussion} for details.
+
 \bigskip
 \tableofcontents
 \bigskip
@@ -474,194 +541,158 @@ balances forward via \texttt{forwardEmergencyCall}.
 \label{sec:primer}
 %% ============================================================
 
-Readers comfortable with SCIF may skip this section. For a Solidity developer
-encountering SCIF for the first time, the following is enough to read every
-code listing in this report and to reproduce the analysis locally.
+Readers comfortable with SCIF may skip to \cref{sec:methodology}.
+For everyone else, this section gives you enough to read every code listing
+in the report. There are only three ideas you need.
+
+\subsection{Three Labels}
+\label{sec:primer-labels}
+
+Every value in SCIF carries one of three labels that say \emph{who vouches
+for it}:
+
+\begin{description}
+  \item[\texttt{\{this\}}] --- the \textbf{contract itself} guarantees this
+    value (e.g., an immutable field set at deploy time).
+  \item[\texttt{\{sender\}}] --- the \textbf{caller} supplied this value.
+    It is untrusted until the contract explicitly accepts it.
+  \item[\texttt{\{any\}}] --- \textbf{nobody} vouches for it. Fully public,
+    no integrity guarantee.
+\end{description}
+
+In plain Solidity all three look the same: a \texttt{uint256} is a
+\texttt{uint256} regardless of whether it came from calldata or from a
+trusted storage slot. SCIF makes the difference visible.
+
+\subsection{One Operation: \texttt{endorse}}
+\label{sec:primer-endorse}
+
+The only way to promote a value from \texttt{\{sender\}} to \texttt{\{this\}}
+is to write an explicit \texttt{endorse}:
+
+\begin{lstlisting}[style=scifstyle,numbers=none]
+  uint{this} trustedAmount = endorse(amount, sender -> this);
+\end{lstlisting}
+
+This line says: ``I, the contract developer, accept responsibility for
+treating \texttt{amount} as trusted from this point on.'' The SCIF compiler
+checks that an \texttt{endorse} exists wherever it is needed. It does
+\emph{not} check that the justification is correct --- that remains the
+developer's job. The benefit is that every trust promotion becomes a named,
+located line item that a reviewer can audit.
+
+\subsection{One Rule: External Calls Drop Trust}
+\label{sec:primer-pc}
+
+After any external call (to a contract SCIF cannot analyze), SCIF assumes
+the worst: the callee might have re-entered and changed state. So SCIF
+\textbf{drops the trust level to \texttt{\{any\}}} after the call. Any
+subsequent state write that requires \texttt{\{this\}} integrity is rejected.
+
+To keep trust across an external call, wrap it in \texttt{lock(this)}.
+This is SCIF's equivalent of Solidity's \texttt{nonReentrant} modifier,
+but scoped to exactly the block that needs it:
+
+\begin{lstlisting}[style=scifstyle,numbers=none]
+  lock(this) {
+      uint{this} before = tok.balanceOf(address(this));
+      _wrap(token, amount, ...);       // external call
+      uint{this} after = tok.balanceOf(address(this));
+      // still trusted here because lock prevents re-entrance
+  }
+\end{lstlisting}
+
+Without the lock, the second \texttt{balanceOf} read would be \texttt{\{any\}}
+and the comparison with \texttt{amount} (which is \texttt{\{this\}}) would
+fail at compile time. This is how SCIF catches reentrancy statically, and
+why every external call in the models sits inside a \texttt{lock} block.
 
 \subsection{Syntax Cheat Sheet}
 \label{sec:primer-syntax}
 
-\Cref{tab:scif-syntax} maps the SCIF constructs used in this report to their
-Solidity counterparts and explains their information-flow meaning. The left
-column is what you read in the \texttt{.scif} files, the middle column is what
-the Solidity compiler target would look like, and the right column is the
-type-system guarantee SCIF provides.
+\Cref{tab:scif-syntax} maps every SCIF construct used in this report to its
+Solidity equivalent.
 
 \begin{table}[h]
 \centering
 \caption{SCIF constructs used in this report.}
 \label{tab:scif-syntax}
 \small
-\begin{tabular}{@{}p{4.3cm}p{4.3cm}p{5.8cm}@{}}
+\begin{tabular}{@{}p{4.8cm}p{4.3cm}p{5.2cm}@{}}
 \toprule
-\textbf{SCIF construct} & \textbf{Solidity equivalent} & \textbf{IFC meaning} \\
+\textbf{SCIF} & \textbf{Solidity} & \textbf{What it means} \\
 \midrule
-\texttt{address\{this\}} & \texttt{address} (trusted field) & Only the contract can establish this value. \\
-\texttt{uint\{sender\}} & \texttt{uint256} calldata parameter & Caller-supplied, untrusted until endorsed. \\
-\texttt{bytes\{any\}} & \texttt{bytes} (public data) & No integrity guarantee. \\
+\texttt{address\{this\}} & \texttt{address} & Contract-trusted value. \\
+\texttt{uint\{sender\}} & \texttt{uint256} (calldata) & Caller-supplied, untrusted. \\
+\texttt{endorse(x, sender -> this)} & (nothing --- implicit) & Mark \texttt{x} as trusted. \\
 \addlinespace
-\texttt{endorse(x, sender~->~this)} & (implicit) & Promote \texttt{x} from \{sender\} to \{this\}. Type-checked as lexically present; semantic validity is the developer's responsibility. \\
+\texttt{lock(this) \{ ... \}} & \texttt{nonReentrant} scope & Keep trust across external calls. \\
+\texttt{atomic \{ ... \} rescue * \{ ... \}} & \texttt{try/catch} & Isolate failure; trust drops inside \texttt{rescue}. \\
 \addlinespace
-\texttt{lock(this) \{ ... \}} & \texttt{nonReentrant} modifier scope & Holds a reentrancy lock at label \{this\}. Inside the block, PC label stays at \{this\} even across external calls. \\
-\addlinespace
-\texttt{atomic \{ ... \} rescue * \{ ... \}} & \texttt{try \{ ... \} catch \{ ... \}} & IFC-aware failure boundary: PC label inside \texttt{rescue} reflects that the call may have been attacker-induced. \\
-\addlinespace
-\texttt{@public} function & \texttt{external} function & Shorthand for the label triple \{sender -> this; this\}: anyone may call (external), control flow auto-endorses (internal), and the function holds a lock at \{this\}. \\
-\addlinespace
-\texttt{throw ExceptionName()} & \texttt{revert ExceptionName()} & Typed revert with a named exception. \\
-\addlinespace
-\texttt{sender} (identifier) & \texttt{msg.sender} & Address of the current call's immediate caller. \\
-\texttt{this} (identifier) & \texttt{address(this)} & Address of the current contract. \\
+\texttt{@public} & \texttt{external} & Anyone can call; reentrancy-locked. \\
+\texttt{throw X()} & \texttt{revert X()} & Revert with a named error. \\
+\texttt{sender} & \texttt{msg.sender} & Caller address. \\
+\texttt{result = ...} & \texttt{return ...} & Return value. \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{The \texttt{@public} Triple and PC Labels}
-\label{sec:primer-public}
-
-Every SCIF function carries three labels:
-\begin{itemize}
-  \item $\ell_{ex}$ (external) --- who may invoke the function.
-  \item $\ell_{in}$ (internal) --- the integrity of the function's body.
-  \item $\ell_{lk}$ (lock) --- the reentrancy lock held during execution.
-\end{itemize}
-The annotation \texttt{@public} is shorthand for $\{\texttt{sender} \to
-\texttt{this};\ \texttt{this}\}$: anyone may call it ($\ell_{ex} =
-\{\texttt{sender}\}$), the body executes at contract integrity after the
-automatic endorsement ($\ell_{in} = \{\texttt{this}\}$), and a \{this\} lock
-is held ($\ell_{lk} = \{\texttt{this}\}$). This is the label triple of most
-external entry points in the models.
-
-\paragraph{The program counter label.}
-The \emph{PC label} is the integrity of the control-flow context at each
-program point. Informally: if execution reaches a point only because a
-trusted condition held, the PC label is trusted. The key rule is
-\textbf{PC degrades after any external call}: after calling a contract whose
-code SCIF cannot analyze, control flow may have been influenced by the
-callee, so the PC drops to \{any\}. State writes with \{this\} integrity are
-rejected under a \{any\} PC --- this is how SCIF catches reentrancy statically.
-
-The \texttt{lock(this)} construct prevents degradation: inside a locked
-block, the PC label stays at \{this\} across external calls, because the
-lock guarantees no re-entrant call can interleave and influence state. This
-is why the balance invariant in \cref{sec:med-balance} requires the full
-read--call--read--check sequence to be inside \texttt{lock(this)}.
-
-\subsection{Worked Translation: ForwarderBase}
+\subsection{Worked Example: ForwarderBase}
 \label{sec:primer-example}
 
-The following walk-through takes the access-control pattern from
-\texttt{ForwarderBase.sol} and shows the corresponding SCIF code step by
-step. This is the simplest non-trivial translation in the models.
+Here is the access-control function from \texttt{ForwarderBase}, first in
+Solidity, then in SCIF. The SCIF version is only a few lines longer, but
+it makes every trust decision visible.
 
-\paragraph{Step 1: the Solidity original.}
+\paragraph{Solidity (trust hidden).}
 
-\begin{lstlisting}[style=soliditystyle,caption={Simplified \texttt{ForwarderBase.forwardCall} in Solidity.}]
-contract ForwarderBase {
-    address public immutable PROTOCOL_ADAPTER;
-    bytes32 public immutable LOGIC_REF;
-
-    function forwardCall(bytes32 logicRef, bytes calldata input)
-        external returns (bytes memory)
-    {
-        if (msg.sender != PROTOCOL_ADAPTER) revert UnauthorizedCaller();
-        if (logicRef != LOGIC_REF) revert UnauthorizedLogicRef();
-        return _forwardCall(input);
-    }
+\begin{lstlisting}[style=soliditystyle,caption={\texttt{ForwarderBase.forwardCall} --- where does trust change?}]
+function forwardCall(bytes32 logicRef, bytes calldata input)
+    external returns (bytes memory)
+{
+    if (msg.sender != PROTOCOL_ADAPTER) revert UnauthorizedCaller();
+    if (logicRef != LOGIC_REF) revert UnauthorizedLogicRef();
+    return _forwardCall(input);  // input is treated as trusted here --- why?
 }
 \end{lstlisting}
 
-Trust flow is implicit: \texttt{input} is a calldata bytes object (untrusted),
-but after the \texttt{msg.sender} check, the rest of the function uses it as
-if it were trusted. A reader must infer that trust promotion from the guard.
+A Solidity reader cannot tell \emph{from the code alone} where \texttt{input}
+goes from untrusted to trusted. The answer is ``after the
+\texttt{msg.sender} check,'' but that is an inference, not a visible mark.
 
-\paragraph{Step 2: label the fields.}
-Immutable addresses set by the deployer carry contract-level integrity ---
-once set, only the contract itself determines their value. SCIF writes this as
-\texttt{address\{this\}}. Because SCIF's \texttt{final} qualifier requires
-declaration-site initialization (not constructor-time), we drop \texttt{final}
-and endorse the constructor arguments manually:
+\paragraph{SCIF (trust visible).}
 
-\begin{lstlisting}[style=scifstyle,caption={Field declarations and constructor (excerpt from \texttt{ForwarderBase.scif}).}]
-contract ForwarderBase {
-    address{this} _PROTOCOL_ADAPTER;
-    uint{this}    _LOGIC_REF;        // bytes32 modeled as uint
+\begin{lstlisting}[style=scifstyle,caption={Same function in SCIF --- every trust promotion is named.}]
+@public
+bytes{this} forwardCall(uint logicRef, bytes input)
+    throws (UnauthorizedCaller, UnauthorizedLogicRef) {
 
-    constructor(address protocolAdapter, uint logicRef) {
-        _PROTOCOL_ADAPTER = endorse(protocolAdapter, sender -> this);
-        _LOGIC_REF        = endorse(logicRef,        sender -> this);
-        super();
-    }
+    if (sender != _PROTOCOL_ADAPTER) { throw UnauthorizedCaller(); }
+
+    // These two lines ARE the trust boundary:
+    uint{this}  endorsedLogicRef = endorse(logicRef, sender -> this);
+    bytes{this} endorsedInput    = endorse(input,    sender -> this);
+
+    if (_LOGIC_REF != endorsedLogicRef) { throw UnauthorizedLogicRef(); }
+    result = _forwardCall(endorsedInput);
 }
 \end{lstlisting}
 
-The \texttt{endorse} at construction time documents the trust assumption:
-``the deployer is trusted to supply valid initial configuration.''
+The two \texttt{endorse} lines are the only place where untrusted data
+becomes trusted. Remove either one and the program will not compile.
+Across the whole codebase, listing every \texttt{endorse} gives you a
+complete checklist of every trust assumption the contracts rely on ---
+the central output of this report.
 
-\paragraph{Step 3: label the function and its parameters.}
-The function is externally callable, so its label triple is \texttt{@public}.
-Its parameters arrive with \{sender\} integrity. SCIF requires us to check
-the caller \emph{and} explicitly endorse the parameters before using them in
-\{this\}-integrity contexts:
-
-\begin{lstlisting}[style=scifstyle,caption={\texttt{forwardCall} with explicit endorsements.}]
-    @public
-    bytes{this} forwardCall(uint logicRef, bytes input)
-        throws (UnauthorizedCaller, UnauthorizedLogicRef) {
-
-        // Access control: runtime check bridges {sender} and {this}.
-        if (sender != _PROTOCOL_ADAPTER) { throw UnauthorizedCaller(); }
-
-        // After the check, endorse the PA-supplied data.
-        uint{this}  endorsedLogicRef = endorse(logicRef, sender -> this);
-        bytes{this} endorsedInput    = endorse(input,    sender -> this);
-
-        if (_LOGIC_REF != endorsedLogicRef) { throw UnauthorizedLogicRef(); }
-
-        result = _forwardCall(endorsedInput);
-    }
-\end{lstlisting}
-
-\paragraph{Step 4: what the type-checker verifies.}
-\begin{itemize}
-  \item \texttt{sender} has label \{sender\}; \texttt{\_PROTOCOL\_ADAPTER}
-    has label \{this\}. The comparison \texttt{sender != \_PROTOCOL\_ADAPTER}
-    is allowed because equality tests work across labels.
-  \item The \texttt{endorse} at the two lines after the check is lexically
-    present --- SCIF verifies that a runtime guard precedes each promotion.
-  \item The comparison \texttt{\_LOGIC\_REF != endorsedLogicRef} is between
-    two \{this\} values, which is type-correct.
-  \item \texttt{\_forwardCall} expects \texttt{bytes\{this\}}, and we pass
-    \texttt{endorsedInput} (\{this\}) --- type-correct.
-  \item If we had omitted either endorsement, SCIF would reject the program
-    with a label mismatch error at the point of use.
-\end{itemize}
-
-\paragraph{What this illustrates.}
-The Solidity version has the same security properties, but the trust
-promotions are invisible: a reader cannot tell from the function body alone
-which values are trusted and where the promotion happened. The SCIF version
-makes this explicit at every step. Applied across the whole codebase, this
-discipline produces the enumerable checklist of trust boundaries that is the
-core contribution of this report.
-
-\subsection{Going Further: the Protocol Adapter}
+\subsection{The Same Idea, Applied to the Protocol Adapter}
 \label{sec:primer-pa}
 
-\texttt{ForwarderBase} has two endorsement sites and one caller; the PA is
-where SCIF's discipline pays off more visibly, because several attacker-
-influenced fields reach state-modifying code after crossing a
-\emph{cryptographic} oracle boundary instead of an address-equality check.
-\Cref{fig:label-pipeline} in \cref{sec:high1} shows the resulting pipeline;
-this subsection shows the code.
-
-The real \texttt{ProtocolAdapter.execute}
-(\href{https://github.com/anoma/pa-evm/blob/main/contracts/src/ProtocolAdapter.sol}{\texttt{ProtocolAdapter.sol}}
-in~\cite{paevmrepo}) handles many concerns (batching, merkle roots, external
-payloads); the trust-critical core reduces to a short function.
-\Cref{fig:pa-sidebyside} places the Solidity and SCIF forms of that core
-side-by-side --- trust implicit on the left, trust named and located on the
-right.
+\texttt{ForwarderBase} only has two \texttt{endorse} sites. The PA has six,
+because its trust boundary is a ZK proof instead of a simple caller check.
+\Cref{fig:pa-sidebyside} puts the Solidity and SCIF versions of the PA's
+core function side-by-side. The full source is in
+\href{https://github.com/anoma/pa-evm/blob/main/contracts/src/ProtocolAdapter.sol}{\texttt{ProtocolAdapter.sol}}~\cite{paevmrepo};
+the pipeline view is in \cref{fig:label-pipeline}.
 
 \begin{figure}[h]
 \noindent
@@ -745,30 +776,18 @@ it.}
 \label{fig:pa-sidebyside}
 \end{figure}
 
-\paragraph{What changes, concretely.}
-Three invariants that are implicit in Solidity become syntactically
-enforced in SCIF:
-\begin{enumerate}
-  \item \textbf{Every attacker-influenced field is named as such.} The
-    \texttt{endorse(x, sender -> this)} expressions form an exhaustive list
-    that maps one-to-one onto the RISC Zero journal check (HIGH-1,
-    \cref{fig:label-pipeline}).
-  \item \textbf{The ZK verifier is a declared oracle.} \texttt{endorsedProof}
-    is constructed before the call; the type system records that passing
-    \{sender\} bytes to a \{this\}-accepting verifier requires an explicit
-    promotion, preventing silent trust escalation if the verifier signature
-    changes.
-  \item \textbf{Reentrancy is a lock on a specific block.} Instead of a
-    function-level modifier, \texttt{lock(this)} wraps exactly the code that
-    requires the PC label to remain \{this\} across the external call. The
-    SCIF type-checker rejects the program if the lock is too narrow to cover
-    the state writes and the \texttt{\_executeForwarderCall}, so ``enough
-    protection'' is no longer a judgement call.
-\end{enumerate}
+\paragraph{What this shows.}
+On the left (Solidity), six calldata fields are used after
+\texttt{\_verifyProof} with no visible mark that they just crossed a trust
+boundary. On the right (SCIF), each \texttt{endorse} line names the field
+and marks exactly where trust is granted. Listing all six gives you a
+one-to-one checklist: each field must be a constrained output of the ZK
+circuit. That checklist is the basis of finding HIGH-1 (\cref{sec:high1})
+and the pipeline in \cref{fig:label-pipeline}.
 
-Compare this with \texttt{ForwarderBase} in \cref{sec:primer-example}: the
-same discipline, applied at a stronger oracle boundary (cryptographic instead
-of caller-identity), is what surfaces the checklist at the core of HIGH-1.
+The \texttt{lock(this)} block at the bottom scopes the reentrancy
+protection to exactly the state writes and external call that need it ---
+if the scope were too narrow, SCIF would reject the program.
 
 \subsection{Running the SCIF Compiler}
 \label{sec:primer-running}
