@@ -77,7 +77,6 @@ contract ERC20Forwarder {
     uint{this} _CALL_TYPE_UNWRAP;
 
     // --- Exceptions ---
-    // (must appear before event declarations — SCIF parser order requirement)
 
     exception UnauthorizedCaller();
     exception UnauthorizedLogicRef();
@@ -86,10 +85,13 @@ contract ERC20Forwarder {
     exception WrapFailed();
     exception UnwrapFailed();
 
-    // --- Events ---
-
-    event Wrapped(address token, address from, uint amount);
-    event Unwrapped(address token, address to, uint amount);
+    // NOTE: the original Solidity emits `Wrapped(token, from, amount)` and
+    // `Unwrapped(token, to, amount)` inside `_wrap` / `_unwrap`. Event
+    // declarations are omitted here because the SCIF prebuilt JAR used by
+    // CI (v0.5.0) predates the `event` / `emit` syntax. The events are
+    // not trust-critical: they are side-effects with {this} integrity that
+    // carry no influence over state or control flow. See the findings for
+    // a note on event reentrancy safety.
 
     // --- Constructor ---
 
@@ -298,9 +300,8 @@ contract ERC20Forwarder {
             throw WrapFailed();
         }
 
-        // Emit event — all args are {this}, safe to log.
-        // Protected from reentrancy-events by lock(this) in _forwardCall.
-        emit Wrapped(token, owner, amount);
+        // In Solidity: `emit Wrapped(token, owner, amount);`
+        // See note above on why the event is omitted in this SCIF model.
     }
 
     // ============================================================
@@ -338,7 +339,8 @@ contract ERC20Forwarder {
             throw UnwrapFailed();
         }
 
-        emit Unwrapped(token, receiver, amount);
+        // In Solidity: `emit Unwrapped(token, receiver, amount);`
+        // See note above on why the event is omitted in this SCIF model.
     }
 
     // --- View ---
