@@ -55,11 +55,21 @@
 //   - final fields: use address{this} + constructor endorse.
 //
 // ENDORSEMENT SUMMARY:
-//   Constructor: 2 endorsements (verifier router, owner)
+//   Constructor: 3 endorsements (verifier router, selector, owner)
 //   execute: 1 (proof) + 7 consumed fields + 6 created fields + 1 delta = 15
 //   _executeForwarderCall: 0 (inputs already {this})
-//   Total per single-unit tx: 17 endorsements
+//   Total per single-unit tx: 18 endorsements
 //   Per additional compliance unit: +13 (7 consumed + 6 created)
+//
+//   NOTE ON STRUCT-FLATTENING REDUNDANCY: In the real Solidity,
+//   consumedTag == consumedNullifier and createdTag == createdCommitment
+//   (both come from the same complianceVerifierInput field). The SCIF
+//   model endorses both because they appear as separate parameters after
+//   flattening the Solidity struct hierarchy. Of the 15 execute()
+//   endorsements, 2 (eCTag, eXTag) are structurally redundant with
+//   eCNullifier and eXCommitment respectively. The downstream operations
+//   (_addNullifier, _addCommitment) use the semantically correct names
+//   (nullifier, commitment) — not tag.
 //
 // ADDITIONAL COVERAGE (vs ProtocolAdapterCore.scif):
 //   + isEmergencyStopped with verifier-paused external call
@@ -212,6 +222,12 @@ contract ProtocolAdapterFull {
         // the endorsement is unsound.
 
         // Consumed resource fields (6 endorsements)
+        // NOTE: In the real Solidity, consumedTag is computed as
+        // complianceVerifierInput.instance.consumed.nullifier — i.e. the
+        // same value as consumedNullifier. Both are modeled here because
+        // the SCIF model flattens different struct hierarchies (compliance
+        // vs logic verifier inputs) into separate parameters. The nullifier
+        // operation below uses eCNullifier (the semantically correct name).
         uint{this} eCNullifier  = endorse(consumedNullifier, sender -> this);
         uint{this} eCLogicRef   = endorse(consumedLogicRef, sender -> this);
         uint{this} eCRoot       = endorse(consumedCommitmentTreeRoot, sender -> this);
@@ -221,6 +237,10 @@ contract ProtocolAdapterFull {
         bytes{this} eCFwdExpOut = endorse(consumedForwarderExpectedOutput, sender -> this);
 
         // Created resource fields (5 endorsements — no commitmentTreeRoot)
+        // NOTE: Same struct-flattening note as above: createdTag is
+        // complianceVerifierInput.instance.created.commitment, i.e. the
+        // same value as createdCommitment. The commitment operation below
+        // uses eXCommitment (the semantically correct name).
         uint{this} eXCommitment = endorse(createdCommitment, sender -> this);
         uint{this} eXLogicRef   = endorse(createdLogicRef, sender -> this);
         uint{this} eXTag        = endorse(createdTag, sender -> this);
@@ -315,7 +335,10 @@ contract ProtocolAdapterFull {
 
         // Add nullifier — prevents double-spend.
         // The set rejects duplicates.
-        _addNullifier(tag);
+        // NOTE: In the real Solidity, tag == nullifier (both are
+        // complianceVerifierInput.instance.consumed.nullifier). We use
+        // `nullifier` here as the semantically correct parameter name.
+        _addNullifier(nullifier);
     }
 
     // ============================================================
@@ -336,7 +359,10 @@ contract ProtocolAdapterFull {
                               forwarderInput, forwarderExpectedOutput);
 
         // Add commitment to the tree and update the latest root.
-        _addCommitment(tag);
+        // NOTE: In the real Solidity, tag == commitment (both are
+        // complianceVerifierInput.instance.created.commitment). We use
+        // `commitment` here as the semantically correct parameter name.
+        _addCommitment(commitment);
     }
 
     // ============================================================

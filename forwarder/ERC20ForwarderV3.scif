@@ -533,16 +533,18 @@ contract ERC20ForwarderV3Core {
 
         bytes{this} endorsedInput = endorse(input, sender -> this);
 
-        // GAP-3 NOTE: The real V3 dispatches endorsedInput to _forwardCall,
-        // which routes to _migrateV1, _migrateV2, Wrap, or Unwrap.
-        // This simplified model returns endorsedInput directly.
-        // A complete model would decode callType from endorsedInput and dispatch.
+        // GAP-3 STUB: The real V3 dispatches endorsedInput to _forwardCall,
+        // which decodes callType and routes to _migrateV1, _migrateV2,
+        // Wrap, or Unwrap — all involving external calls and state mutations.
+        // SCIF cannot model this dispatch because it lacks abi.decode (GAP-1).
+        //
+        // The lock(this) matches the real Solidity's nonReentrant modifier
+        // on forwardEmergencyCall. In a complete model, the lock would
+        // protect the state transitions and external calls inside the
+        // dispatch. Here it documents the reentrancy guard requirement
+        // even though the stub has no external calls.
         lock(this) {
-            atomic {
-                result = endorsedInput;
-            } rescue * {
-                result = endorsedInput;
-            }
+            result = endorsedInput;
         }
     }
 

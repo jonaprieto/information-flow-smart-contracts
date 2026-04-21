@@ -357,7 +357,7 @@ endorsements --- entirely hidden in Solidity --- becomes an explicit, navigable
 dependency graph.
 
 \paragraph{Code under analysis.}
-The Solidity contracts analysed in this report live in two public
+The Solidity contracts analyzed in this report live in two public
 repositories maintained by Anoma:
 \begin{itemize}
   \item \textbf{Protocol Adapter}~\cite{paevmrepo} ---
@@ -440,9 +440,9 @@ non-local control flow and transactions.
 
 Following the Anoma specification~\cite{anomaspecs}, the Ethereum Virtual
 Machine (EVM) protocol adapter is a smart contract written in Solidity that
-can be deployed to EVM-compatible chains and roll-ups to connect them to the
+can be deployed to EVM-compatible chains and rollups to connect them to the
 Anoma protocol. It allows Anoma applications to run on existing EVM chains,
-analogous to how drivers let an operating system run on different physical
+analogous to how drivers let an operating system run on different
 hardware. The current prototype is \emph{settlement-only}: it processes
 fully-evaluated transaction functions and does not implement the full executor
 engine behaviour.
@@ -484,10 +484,11 @@ owners. It exposes two operations:
   \item \textbf{Unwrap}: push tokens to a receiver address, consuming a
     nullifier.
 \end{itemize}
-Access is gated by \texttt{msg.sender == \_PROTOCOL\_ADAPTER}, enforced in
-\texttt{ForwarderBase.forwardCall}. The forwarder also inherits
-\texttt{EmergencyMigratableForwarderBase}, which provides a two-step emergency
-exit governed by an \texttt{\_EMERGENCY\_COMMITTEE} address.
+Access is gated by
+\texttt{msg.sender\,==\,\_PROTOCOL\_ADAPTER}, enforced in
+\texttt{ForwarderBase.\allowbreak{}forwardCall}.  The forwarder also inherits
+\texttt{Emergency\-Migratable\-Forwarder\-Base}, which provides a two-step
+emergency exit governed by an \texttt{\_EMERGENCY\_COMMITTEE} address.
 
 \begin{figure}[h]
 \centering
@@ -821,7 +822,7 @@ analysis are in \cref{app:reproducibility}.
 The models are not line-for-line rewrites. The goal is to extract the
 \emph{trust-critical core}: the paths through which user-supplied data reaches
 state-modifying operations or external calls with elevated authority. Solidity
-features not relevant to IFC (event emission gas optimization, library
+features not relevant to IFC (event emission, gas optimization, library
 delegation, complex struct packing) are omitted. Solidity features that
 \emph{cannot} be expressed in SCIF are documented as explicit limitations with
 justifications for why the omission does not affect the IFC conclusions.
@@ -907,24 +908,24 @@ enforce eight runtime checks across the two functions:
 \caption{All runtime guards on the emergency path
   (\fwdrefR{bases/}{EmergencyMigratableForwarderBase.sol}{42}{69}).}
 \label{tab:emergency-guards}
-\begin{tabular}{@{}clll@{}}
+\begin{tabular}{@{}cp{3cm}p{5cm}p{4.2cm}@{}}
 \toprule
-\textbf{\#} & \textbf{Function} & \textbf{Guard} & \textbf{What it rejects} \\
+\textbf{\#} & \textbf{Function} & \textbf{Guard} & \textbf{Rejects} \\
 \midrule
-1 & \texttt{setEmergencyCaller}   & \texttt{\_checkCaller(\_EMERGENCY\_COMMITTEE)}
-  & anyone except the committee \\
+1 & \texttt{setEmergency\-Caller}   & \texttt{\_checkCaller(\allowbreak{}\_EMERGENCY\_COMMITTEE)}
+  & anyone except committee \\
 2 & & \texttt{newEmergencyCaller != address(0)}
   & zero-address appointment \\
 3 & & \texttt{\_emergencyCaller != address(0)}
-  & second appointment (write-once) \\
-4 & & \texttt{\_checkEmergencyStopped()}
-  & PA still running (not stopped) \\
+  & second appointment \\
+4 & & \texttt{\_checkEmergency\-Stopped()}
+  & PA still running \\
 \addlinespace
-5 & \texttt{forwardEmergencyCall} & \texttt{\_emergencyCaller != address(0)}
+5 & \texttt{forwardEmergency\-Call} & \texttt{\_emergencyCaller != address(0)}
   & caller not yet appointed \\
-6 & & \texttt{\_checkCaller(\_emergencyCaller)}
-  & anyone except appointed caller \\
-7 & & \texttt{\_checkEmergencyStopped()}
+6 & & \texttt{\_checkCaller(\allowbreak{}\_emergencyCaller)}
+  & anyone except caller \\
+7 & & \texttt{\_checkEmergency\-Stopped()}
   & PA no longer stopped \\
 8 & & \texttt{nonReentrant}
   & re-entrant calls \\
@@ -1012,11 +1013,11 @@ In the SCIF model, the entire emergency path reduces to two
 \texttt{endorse} calls with no intermediate endorser:
 
 \[
-  \underbrace{\texttt{\_EMERGENCY\_COMMITTEE}}_{\{this\}}
-  \xrightarrow[\text{1 endorsement}]{\texttt{setEmergencyCaller}}
-  \underbrace{\texttt{\_emergencyCaller}}_{\{this\}}
-  \xrightarrow[\text{1 endorsement}]{\texttt{forwardEmergencyCall}}
-  \text{drain all tokens}
+  \underbrace{\texttt{\_EMERGENCY\_COMMITTEE}}_{\{\texttt{this}\}}
+  \;\xrightarrow{\;\texttt{set\-Emergency\-Caller}\;}\;
+  \underbrace{\texttt{\_emergencyCaller}}_{\{\texttt{this}\}}
+  \;\xrightarrow{\;\texttt{forward\-Emergency\-Call}\;}\;
+  \text{drain}
 \]
 
 A time-lock would appear as a third node in this chain (a pending
@@ -1075,7 +1076,7 @@ promotion between the committee and \texttt{\_emergencyCaller}.}
 
 \paragraph{Severity assessment.} The committee is, by design, the root of
 trust for the emergency path. Whether this is acceptable depends on the
-deployment's governance model. At the time of writing the emergency caller
+deployment's governance model. At the time of writing, the emergency caller
 is operated as an off-chain multisig with a small number of signers (one to
 two), so a single key compromise does not translate to a single-signer drain
 in practice. The SCIF finding still applies because the contract itself
@@ -1482,10 +1483,11 @@ combines the V3 bug with the emergency recovery scenario.
 \subsubsection{GAP-4: MED-3 --- V3 SCIF Model Uses Wrong PA for Emergency Stop Check (Fixed)}
 
 The V3 SCIF model originally called
-\texttt{IProtocolAdapterEmergencyCheck(\_PROTOCOL\_ADAPTER\_V2)} for the
-emergency stop check, because \texttt{paV3Addr} was accepted as a constructor
-parameter but never stored. In the real Solidity, \texttt{\_checkEmergencyStopped}
-uses the inherited \texttt{\_PROTOCOL\_ADAPTER} (set to V3's PA).
+\texttt{IProtocolAdapterEmergencyCheck(\allowbreak{}\_PROTOCOL\_ADAPTER\_V2)}
+for the emergency stop check, because \texttt{paV3Addr} was accepted as a
+constructor parameter but never stored.  In the real Solidity,
+\texttt{\_checkEmergencyStopped} uses the inherited
+\texttt{\_PROTOCOL\_ADAPTER} (set to V3's PA).
 
 \textbf{Fix applied:} The model now stores
 \texttt{address\{this\} \_PROTOCOL\_ADAPTER\_V3}, assigns it from
@@ -1596,6 +1598,19 @@ contract's \texttt{lock(this)} is correctly scoped to that contract's own
 integrity domain, accurately reflecting this EIP-1153 boundary. Reviewers
 should not assume that the PA's reentrancy guard transitively protects
 downstream callees.
+
+A related subtlety: the PA's \texttt{emergencyStop()} function does
+\emph{not} carry the \texttt{nonReentrant} modifier --- it is gated only by
+\texttt{onlyOwner} and \texttt{whenNotPaused}.  During the call chain
+\texttt{PA.execute} $\to$ \texttt{Forwarder} $\to$ \texttt{Permit2} $\to$
+\texttt{ERC20.transferFrom}, a malicious ERC20 token could call back to
+\texttt{emergencyStop()} if the callback address coincides with the PA
+owner.  This would set \texttt{\_paused\,=\,true} mid-execution; the
+in-flight \texttt{execute} call would still complete (its pause check
+already passed and the transient slot blocks re-entry), but all subsequent
+transactions would revert.  The scenario is not exploitable because the
+stop is one-directional and idempotent, yet reviewers should note that the
+EIP-1153 guard boundary does not extend to \texttt{emergencyStop()}.
 
 \paragraph{Pitfall 6: \texttt{atomic/rescue} is not \texttt{try/catch}.}
 Solidity's \texttt{try/catch} allows catching reverts from external calls while
@@ -1829,29 +1844,31 @@ Three extensions would materially strengthen the IFC analysis:
 \section{Reproducibility}
 \label{app:reproducibility}
 
-This appendix explains how to clone the artefact repository, set up the
+This appendix explains how to clone the artifact repository, set up the
 SCIF compiler, and reproduce every typecheck and compilation reported in
 this document.
 
 \subsection{Repository Layout}
 
+\begin{small}
 \begin{verbatim}
 information-flow-smart-contracts/
-├── pa/                          SCIF model: Protocol Adapter
-├── forwarder/                   SCIF models: ForwarderBase, ERC20Forwarder,
-│                                  EmergencyMigratableBase, ERC20ForwarderV3
-├── combined/                    SCIF model: cross-contract CDA trace
-├── interfaces/                  SCIF interfaces: IForwarder, IERC20
-├── findings/                    audit report, per-phase notes, evaluation
-├── doc/                         this LaTeX report
+├── pa/                    PA SCIF models
+├── forwarder/             Forwarder SCIF models
+├── combined/              Cross-contract CDA trace
+├── interfaces/            IForwarder, IERC20
+├── findings/              Audit report, notes, evaluation
+├── doc/                   This LaTeX report
 ├── third_party/
-│   ├── pa-evm/                  git submodule -> anoma/pa-evm
-│   └── anomapay-erc20-forwarder/  git submodule -> anoma/anomapay-erc20-forwarder
-├── .github/workflows/           CI: typecheck + compile + PDF build
-└── justfile                     local build recipes
+│   ├── pa-evm/            submodule: anoma/pa-evm
+│   └── anomapay-erc20-   submodule: anoma/anomapay-
+│       forwarder/           erc20-forwarder
+├── .github/workflows/     CI: typecheck + PDF build
+└── justfile               Local build recipes
 \end{verbatim}
+\end{small}
 
-\subsection{Clone and Initialise}
+\subsection{Clone and Initialize}
 
 \begin{verbatim}
 # Clone with submodules (fetches the Anoma contract sources)
@@ -1864,8 +1881,9 @@ just init
 \end{verbatim}
 
 After this step, the original Solidity contracts are available under
-\texttt{third\_party/pa-evm/contracts/src/} and
-\texttt{third\_party/anomapay-erc20-forwarder/contracts/src/}.
+\texttt{third\_party/\allowbreak{}pa-evm/\allowbreak{}contracts/\allowbreak{}src/}
+and
+\texttt{third\_party/\allowbreak{}anomapay-erc20-forwarder/\allowbreak{}contracts/\allowbreak{}src/}.
 
 \subsection{Install the SCIF Compiler}
 
@@ -1928,16 +1946,19 @@ just compile   forwarder/ForwarderBase.scif
 
 After \texttt{just init}, the vendored contract sources are at:
 
+\begin{small}
 \begin{verbatim}
 # Protocol Adapter
-third_party/pa-evm/contracts/src/ProtocolAdapter.sol
+third_party/pa-evm/contracts/src/
+  ProtocolAdapter.sol
 
-# ERC20 Forwarder
-third_party/anomapay-erc20-forwarder/contracts/src/ERC20Forwarder.sol
-third_party/anomapay-erc20-forwarder/contracts/src/bases/ForwarderBase.sol
-third_party/anomapay-erc20-forwarder/contracts/src/bases/EmergencyMigratableForwarderBase.sol
-third_party/anomapay-erc20-forwarder/contracts/src/drafts/ERC20ForwarderV3.sol
+# ERC20 Forwarder (under third_party/anomapay-erc20-forwarder/)
+contracts/src/ERC20Forwarder.sol
+contracts/src/bases/ForwarderBase.sol
+contracts/src/bases/EmergencyMigratableForwarderBase.sol
+contracts/src/drafts/ERC20ForwarderV3.sol
 \end{verbatim}
+\end{small}
 
 To update the vendored sources to the latest upstream \texttt{main}:
 

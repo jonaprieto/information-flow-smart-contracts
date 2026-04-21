@@ -146,7 +146,7 @@ SCIF's PC label degradation analysis is precise. The lock scope requirement (cov
 
 6. **Glossary**: Sufficient for a Solidity developer. Covers DLM, endorsement, PC label, lock label, CDA, principal, oracle assumption, and atomic/rescue. Missing: "trust chain" and "label lattice" are used in the text but not defined. These could be added.
 
-7. **The report date says "April 2025"** — should be April 2026 if the work is current.
+7. ~~**The report date says "April 2025"**~~ — Stale observation. The report correctly reads "April 2026" (`\date{April 2026}` in `report.tex:202`).
 
 ---
 

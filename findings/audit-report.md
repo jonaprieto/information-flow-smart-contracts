@@ -150,6 +150,8 @@ PA uses `ReentrancyGuardTransient` (EIP-1153), which sets a transient storage sl
 
 **SCIF models this correctly**: each contract's `lock(this)` is scoped to that contract's integrity domain. But reviewers should not assume PA's reentrancy guard transitively protects downstream callees.
 
+**Note**: PA's `emergencyStop()` does not carry the `nonReentrant` modifier — it is gated only by `onlyOwner` and `whenNotPaused`. During the call chain `PA.execute` → `Forwarder.forwardCall` → `Permit2` → `ERC20.transferFrom`, a malicious ERC20 token could theoretically call back to `emergencyStop()` if the callback address coincides with the PA's owner. This would set `_paused = true` mid-execution; the current `execute` call would still complete (its pause check already passed), but subsequent transactions would be blocked. This is not exploitable — the stop is one-directional and idempotent — but the reentrancy guard boundary does not cover `emergencyStop()`.
+
 ### Reentrancy via Malicious ERC20 Token Callbacks During Permit2 Flow
 
 When `_wrap` calls Permit2, Permit2 calls `ERC20.transferFrom(owner, forwarder, amount)`. If `token` is a malicious contract (user-controlled address endorsed via ZK proof — see HIGH-1), its `transferFrom` can execute arbitrary code. The forwarder's `lock(this)` blocks re-entry into the forwarder. PA's transient slot blocks re-entry into `execute`. However, the SCIF model does not verify this cross-contract reentrancy protection — it models the Permit2 call as a simple `void` call via `IPermit2`.
