@@ -22,6 +22,7 @@ integrity policies via the Decentralized Label Model.
 
 | Artefact | Link |
 |----------|------|
+| **Executive summary** | [`docs/executive-summary.md`](./docs/executive-summary.md) |
 | **Research report (PDF, built from `main`)** | [Download from latest successful build](https://nightly.link/jonaprieto/information-flow-smart-contracts/workflows/build-docs/main/research-report.zip) |
 | Report source | [`doc/report.tex`](./doc/report.tex) |
 | Run history (to grab older builds) | [`build-docs.yml` runs on main](https://github.com/jonaprieto/information-flow-smart-contracts/actions/workflows/build-docs.yml?query=branch%3Amain) |
@@ -43,6 +44,7 @@ the workflow's run page (`Actions` → `Build Research Report` → latest run
 | [`forwarder/`](./forwarder) | SCIF models of `ForwarderBase`, `ERC20Forwarder`, `EmergencyMigratableBase`, `ERC20ForwarderV3` |
 | [`combined/`](./combined) | `PaAndForwarder.scif` — cross-contract CDA trace |
 | [`interfaces/`](./interfaces) | `IForwarder`, `IERC20` SCIF interfaces |
+| [`docs/`](./docs) | Executive summary (standalone markdown) |
 | [`findings/`](./findings) | Audit report, per-phase notes, independent evaluation |
 | [`doc/`](./doc) | LaTeX research report (compile with `xelatex`) |
 | [`third_party/`](./third_party) | Submodules: [`anoma/pa-evm`](https://github.com/anoma/pa-evm), [`anoma/anomapay-erc20-forwarder`](https://github.com/anoma/anomapay-erc20-forwarder) |
